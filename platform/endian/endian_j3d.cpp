@@ -61,10 +61,15 @@ extern "C" int port_endian_ntab(void* p, uint32_t size)
 }
 
 // ResTIMG header (0x20 bytes); image and palette data stay big-endian.
+// The pad byte at 0x19 (always zero on disc, never read) marks it converted,
+// so a later check (port_endian_bti_embedded) cannot swap it back: a model's
+// or particle's header can still look big-endian when its sizes and image
+// offset are multiples of 256.
 static void timg(const Buf& b, u32 off)
 {
 	if (!b.has(off, 0x20))
 		return;
+	b.base[off + 0x19] = PE_NATIVE_MARK;
 	b.sw16(off + 0x02); // width
 	b.sw16(off + 0x04); // height
 	b.sw16(off + 0x0A); // numColors
@@ -108,7 +113,6 @@ extern "C" int port_endian_bti(void* p, uint32_t size)
 	if (!b.has(0, 0x20) || b.base[0x19] == PE_NATIVE_MARK || !timg_plausible_be(b))
 		return 0;
 	timg(b, 0);
-	b.base[0x19] = PE_NATIVE_MARK;
 	return 1;
 }
 
@@ -121,7 +125,6 @@ extern "C" int port_endian_bti_embedded(void* p)
 	if (b.base[0x19] == PE_NATIVE_MARK || !timg_plausible_be(b))
 		return 0;
 	timg(b, 0);
-	b.base[0x19] = PE_NATIVE_MARK;
 	return 1;
 }
 
@@ -436,6 +439,11 @@ static void mat(const Buf& b, bool v21)
 	Section s[30];
 	for (int i = 0; i < nk; i++)
 		s[i] = { b.sw32(0x0C + i * 4), kinds[i], 0 };
+	// J3DMaterialFactory has no indirect data unless it starts more than 4
+	// bytes after the name table; retail models (mamma's mirrors, the talk
+	// cursor) set the two offsets equal, and the names own that data.
+	if (!v21 && s[3].off - s[2].off <= 4)
+		s[3].off = 0;
 	int n = layout_sections(s, nk, b.size);
 	for (int i = 0; i < n; i++)
 		mat_section(b, s[i], v21);

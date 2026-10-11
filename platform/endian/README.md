@@ -26,7 +26,7 @@ This directory holds those converters, the format inventory (`INVENTORY.md`), an
   That covers `.blo`, `.bmg`, `.prm`, scene `.bin`, JPA BEM1/FLD1 and the AAF stream list; the raw reads in those loaders are fixed by the `endian-*` patches.
 - Every converter is bounded by the buffer size and is safe to call twice:
   - formats with a magic flip it (`J3D2` reads back as `2D3J`), and a flipped magic is reported as `PE_FMT_ALREADY_NATIVE`;
-  - `.bti` and `.bas` set a marker in a pad byte that is always zero on disc and never read;
+  - `.bti` and `.bas` set a marker in a pad byte that is always zero on disc and never read (every converted `ResTIMG` header, in TEX1 and JPA too, carries it, so the embedded-texture hook of `modhook-14` cannot convert one back);
   - the other magic-less formats check that a header offset is still a valid big-endian offset;
   - the AAF checks its first command word.
 
