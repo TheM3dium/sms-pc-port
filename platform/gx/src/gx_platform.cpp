@@ -180,8 +180,8 @@ void captureMouse(bool on) {
 
 // SMS_FULLSCREEN: 1 or desktop (borderless, at the desktop's resolution), or
 // exclusive (the display switches to SMS_FULLSCREEN_MODE=WxH[@Hz], else the
-// desktop's mode). F11 or Alt+Enter toggles between the window and that
-// fullscreen (desktop when SMS_FULLSCREEN is unset).
+// desktop's mode; borderless on Wayland). F11 or Alt+Enter toggles between
+// the window and that fullscreen (desktop when SMS_FULLSCREEN is unset).
 bool s_exclusive = false, s_isFullscreen = false;
 #ifdef _WIN32
 BorderlessWindow s_borderless;
@@ -226,6 +226,16 @@ bool windowsHdrOn() {
 bool windowsHdrOn() { return false; }
 #endif
 
+// Wayland never switches the display's mode: SDL fakes an exclusive mode by
+// drawing at its size and leaving the compositor to scale that up, and how it
+// does differs (on the Steam Deck a 1280x720 mode came out zoomed to fill
+// 1280x800, cut off at the sides). Borderless at the desktop's resolution is
+// the same picture without that step; the internal resolution sets the cost.
+bool waylandNoModes() {
+    const char* driver = SDL_GetCurrentVideoDriver();
+    return driver && strcmp(driver, "wayland") == 0;
+}
+
 // Quitting (the quit key, closing the window) leaves exclusive fullscreen
 // first, so the display returns to the desktop's mode before the process ends
 // rather than Windows restoring it after.
@@ -246,6 +256,11 @@ void setFullscreen(bool on) {
     if (on && s_exclusive && windowsHdrOn()) {
         static bool told = false;
         if (!told) logmsg("Windows HDR is on: borderless fullscreen instead of exclusive, which can leave HDR's colours wrong");
+        told = true;
+        flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
+    } else if (on && s_exclusive && waylandNoModes()) {
+        static bool told = false;
+        if (!told) logmsg("Wayland has no exclusive display modes: borderless fullscreen at the desktop's resolution instead");
         told = true;
         flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
     } else if (on && s_exclusive) {
@@ -493,7 +508,8 @@ bool openWindow(float scale, bool vulkan) {
             int mw = 0, mh = 0;
             const char* fs = getenv("SMS_FULLSCREEN");
             const char* fm = getenv("SMS_FULLSCREEN_MODE");
-            if (fs && !strcmp(fs, "exclusive") && fm && sscanf(fm, "%dx%d", &mw, &mh) == 2 && mw > 0 && mh > 0) {
+            if (fs && !strcmp(fs, "exclusive") && !waylandNoModes() && fm && sscanf(fm, "%dx%d", &mw, &mh) == 2 &&
+                mw > 0 && mh > 0) {
                 outW = float(mw);
                 outH = float(mh);
             }

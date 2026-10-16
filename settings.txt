@@ -49,7 +49,7 @@ frame_rate = 60
 # Fullscreen: off, on (borderless at the desktop's resolution) or exclusive
 # (the display switches to fullscreen_mode, WxH@Hz, else the desktop's mode;
 # with Windows HDR on, exclusive stays borderless: a mode switch can leave
-# HDR's colours wrong).
+# HDR's colours wrong; on Wayland too, which has no display modes to switch).
 # F11 or Alt+Enter switches between the window and fullscreen while playing.
 # fullscreen = off
 # fullscreen_mode = 1920x1080@144
