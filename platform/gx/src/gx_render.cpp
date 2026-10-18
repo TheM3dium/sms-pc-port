@@ -1765,16 +1765,19 @@ static bool asyncReads() {
 // so the count is the samples that passed plus 4 per triangle. Copy passes
 // in between are left out: they end the running query, which is summed at
 // the read. Each clear/read pair of a frame is a slot; a slot that drew the
-// same number of triangles one frame earlier, in one query, is answered from
-// that frame's query, otherwise the queries are waited for.
-enum { kMetricSlots = 32 };
-static GLuint s_mq[2][kMetricSlots];
-static uint32_t s_mqTris[2][kMetricSlots], s_mqFrame[2][kMetricSlots];
+// same number of triangles one or two frames earlier, in one query, is
+// answered from that frame's query (the newest one already read back),
+// otherwise the queries are waited for.
+enum { kMetricSlots = 32, kMetricFrames = 3 };
+static GLuint s_mq[kMetricFrames][kMetricSlots];
+static uint32_t s_mqTris[kMetricFrames][kMetricSlots], s_mqFrame[kMetricFrames][kMetricSlots];
 // With the GL thread, the results of a frame's queries are read once it is
-// shown (prefetchMetrics), so the next frame's reads do not wait for them.
-static uint32_t s_mqResult[2][kMetricSlots];
-static std::atomic<int> s_mqReady[2][kMetricSlots];
-static bool s_mqFetching[2][kMetricSlots];
+// shown (prefetchMetrics), so later frames' reads do not wait for them: the
+// one before a read is often not finished on the GPU yet, the one before
+// that is, so a read takes the newest that has come back.
+static uint32_t s_mqResult[kMetricFrames][kMetricSlots];
+static std::atomic<int> s_mqReady[kMetricFrames][kMetricSlots];
+static bool s_mqFetching[kMetricFrames][kMetricSlots], s_mqHave[kMetricFrames][kMetricSlots];
 
 static uint32_t takeFetchedMetric(int par, int slot) {
     {
@@ -1782,14 +1785,16 @@ static uint32_t takeFetchedMetric(int par, int slot) {
         glt::waitFlag(s_mqReady[par][slot]);
     }
     s_mqFetching[par][slot] = false;
+    s_mqHave[par][slot] = true;
     return s_mqResult[par][slot];
 }
-static bool s_mqUsed[2][kMetricSlots];
+static bool s_mqUsed[kMetricFrames][kMetricSlots];
 static int s_mqSlot = -1;
 static uint32_t s_mqSlotFrame = ~0u;
 static bool s_pixActive = false, s_pixTaint = false;
 static uint32_t s_pixTris = 0;
 static uint64_t s_pixSamples = 0;  // counted before the pending queries
+static uint32_t s_pixLastRead = 0;
 static GLuint s_pixCur = 0;
 static bool s_pixCurPooled = false;
 static std::vector<GLuint> s_queryPool;
@@ -1830,9 +1835,10 @@ void pixMetricClear() {
         s_mqSlot = -1;
     }
     s_mqSlot++;
-    int cur = s_frameNo & 1;
+    int cur = int(s_frameNo % kMetricFrames);
     if (s_mqSlot < kMetricSlots) {
         if (s_mqFetching[cur][s_mqSlot]) takeFetchedMetric(cur, s_mqSlot);  // its last result was never asked for
+        s_mqHave[cur][s_mqSlot] = false;
         if (!s_mq[cur][s_mqSlot]) glGenQueries(1, &s_mq[cur][s_mqSlot]);
         s_pixCur = s_mq[cur][s_mqSlot];
         s_pixCurPooled = false;
@@ -1842,6 +1848,7 @@ void pixMetricClear() {
     }
     s_pixSamples = 0;
     s_pixTris = 0;
+    s_pixLastRead = 0;
     s_pixTaint = !asyncReads() || s_mqSlot >= kMetricSlots;
     glBeginQuery(GL_SAMPLES_PASSED, s_pixCur);
     s_pixActive = true;
@@ -1849,18 +1856,26 @@ void pixMetricClear() {
 
 uint32_t pixMetricRead() {
     flushBatch();
-    if (!s_ready || !s_pixActive) return 0;
+    if (!s_ready) return 0;
+    if (!s_pixActive) return s_pixLastRead;
     glEndQuery(GL_SAMPLES_PASSED);
     uint64_t samples = 0;
-    int cur = s_frameNo & 1, slot = s_mqSlot;
+    int cur = int(s_frameNo % kMetricFrames), slot = s_mqSlot;
     bool fromPrev = false;
     if (!s_pixTaint) {
         s_mqUsed[cur][slot] = true;
         s_mqTris[cur][slot] = s_pixTris;
         s_mqFrame[cur][slot] = s_frameNo;
-        int prev = cur ^ 1;
-        if (s_mqUsed[prev][slot] && s_mqFrame[prev][slot] + 1 == s_frameNo && s_mqTris[prev][slot] == s_pixTris) {
-            samples = s_mqFetching[prev][slot] ? takeFetchedMetric(prev, slot) : queryResult(s_mq[prev][slot]);
+        // an earlier frame's count of the same slot and triangles: the newest
+        // that has come back, waiting only for the older one
+        for (uint32_t age = 1; age < kMetricFrames && !fromPrev; age++) {
+            const int p = int((s_frameNo + kMetricFrames - age) % kMetricFrames);
+            if (!s_mqUsed[p][slot] || s_mqFrame[p][slot] + age != s_frameNo || s_mqTris[p][slot] != s_pixTris) continue;
+            const bool last = age + 1 == kMetricFrames;
+            if (s_mqHave[p][slot]) samples = s_mqResult[p][slot];
+            else if (s_mqFetching[p][slot] && (last || s_mqReady[p][slot].load())) samples = takeFetchedMetric(p, slot);
+            else if (!s_mqFetching[p][slot] && last) samples = queryResult(s_mq[p][slot]);
+            else continue;
             fromPrev = true;
         }
     }
@@ -1879,14 +1894,29 @@ uint32_t pixMetricRead() {
     s_pixCurPooled = true;
     glBeginQuery(GL_SAMPLES_PASSED, s_pixCur);
     uint64_t v = uint64_t(double(samples) / (double(s_scale) * double(s_scale))) + uint64_t(s_pixTris) * 4;
-    return v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v);
+    s_pixLastRead = v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v);
+    return s_pixLastRead;
+}
+
+void pixMetricEnd() {
+    flushBatch();
+    if (!s_ready || !s_pixActive) return;
+    // GXReadPixMetric has already returned the scope's result and started
+    // an empty continuation query. The game's pollution callback explicitly
+    // ends that scope: ordinary scene drawing need not keep counting unused
+    // samples. Keep the completed result and the pooled frame query intact.
+    glEndQuery(GL_SAMPLES_PASSED);
+    if (s_pixCurPooled) s_queryPool.push_back(s_pixCur);
+    pixReleasePending();
+    s_pixActive = false;
 }
 
 static void prefetchMetrics() {
     const uint32_t frame = s_frameNo - 1;
-    const int par = int(frame & 1);
+    const int par = int(frame % kMetricFrames);
     for (int slot = 0; slot < kMetricSlots; slot++) {
-        if (!s_mqUsed[par][slot] || s_mqFrame[par][slot] != frame || s_mqFetching[par][slot]) continue;
+        if (!s_mqUsed[par][slot] || s_mqFrame[par][slot] != frame || s_mqFetching[par][slot] || s_mqHave[par][slot])
+            continue;
         s_mqFetching[par][slot] = true;
         s_mqReady[par][slot].store(0);
         const GLuint q = s_mq[par][slot];
@@ -2364,21 +2394,62 @@ static void verifyEncode(GLuint tex, int ow, int oh, int tw, int th, uint32_t la
 struct WbFetch {
     std::atomic<int> ready{0};
     bool ok = false;
+    uint64_t hash = 0;  // of bytes, made on the GL thread
     std::vector<uint8_t> bytes;
 };
 struct PendingWriteBack {
     const void* dest;
     uint32_t bytes;
-    uint64_t hash;
+    uint64_t hash;       // of the destination when the copy was issued
     GLuint pbo;
     GLsync fence;
     uint32_t readBytes;  // the pixel buffer's size
     uint32_t frame;
     bool cancelled;
     WbFetch* fetch;      // the GL thread's read of it, or null
+    uint32_t clock;      // writeClock() when the copy was issued
 };
 static std::vector<PendingWriteBack> s_writeBacks;
 static std::vector<GLuint> s_freePbos;
+
+// The game's own bytes at a copy's destination must not be overwritten by a
+// write-back that comes later, so a write-back is stored only if the
+// destination still holds what it did when the copy was issued. Hashing it
+// at both ends cost the game's thread more than any other part of a copy
+// (the plaza writes back three, 330 KiB, every frame), so the write stamps
+// answer instead where they can: what the last write-back stored at a
+// destination (hashed on the GL thread as it came in) is still there while no
+// write is stamped on it since, and nothing changed it while no write is
+// stamped after the copy. Every kWbRecheckFrames-th frame hashes as before;
+// SMS_GX_HASH_ALWAYS=1 always does.
+struct StoredWriteBack {
+    uint64_t hash;
+    uint32_t clock;  // writeClock() after storing it
+    uint32_t bytes;
+};
+static std::unordered_map<const void*, StoredWriteBack> s_storedWriteBacks;
+enum : uint32_t { kWbRecheckFrames = 16 };
+
+static bool wbTrustStamps(uint32_t frame) { return trustWriteStamps() && frame % kWbRecheckFrames != 0; }
+
+static uint64_t writeBackDestHash(const void* dest, uint32_t bytes) {
+    auto it = s_storedWriteBacks.find(dest);
+    if (it != s_storedWriteBacks.end() && it->second.bytes == bytes && wbTrustStamps(s_frameNo) &&
+        unwrittenSince(dest, bytes, it->second.clock))
+        return it->second.hash;
+    return hashBytes(dest, bytes);
+}
+
+// An earlier copy to the same place that was still pending when this one was
+// issued has been stored since: what it stored counts as what was there.
+static bool writeBackDestUnchanged(const PendingWriteBack& w) {
+    auto it = s_storedWriteBacks.find(w.dest);
+    const bool after = it != s_storedWriteBacks.end() && it->second.bytes == w.bytes &&
+                       int32_t(it->second.clock - w.clock) > 0;
+    if (wbTrustStamps(w.frame) && unwrittenSince(w.dest, w.bytes, after ? it->second.clock : w.clock)) return true;
+    const uint64_t h = hashBytes(w.dest, w.bytes);
+    return h == w.hash || (after && h == it->second.hash);
+}
 
 static void resolveWriteBack(PendingWriteBack& w) {
     if (w.fetch) {
@@ -2386,11 +2457,14 @@ static void resolveWriteBack(PendingWriteBack& w) {
             GxTimer tw(&s_waitSeconds);
             glt::waitFlag(w.fetch->ready);
         }
-        if (!w.cancelled && w.fetch->ok && hashBytes(w.dest, w.bytes) == w.hash)
+        if (!w.cancelled && w.fetch->ok && writeBackDestUnchanged(w)) {
             storeEncoded(w.fetch->bytes.data(), w.dest, w.bytes);
+            s_storedWriteBacks[w.dest] = StoredWriteBack{w.fetch->hash, writeClock(), w.bytes};
+        }
         delete w.fetch;
         w.fetch = nullptr;
-    } else if (!w.cancelled && hashBytes(w.dest, w.bytes) == w.hash) {
+    } else if (!w.cancelled && writeBackDestUnchanged(w)) {
+        s_storedWriteBacks.erase(w.dest);
         const void* px;
         {
             GxTimer tw(&s_waitSeconds);
@@ -2406,13 +2480,24 @@ static void resolveWriteBack(PendingWriteBack& w) {
     s_freePbos.push_back(w.pbo);
 }
 
-// Stores the write-backs issued before this frame (all of them with `all`).
+// A write-back whose bytes the GL thread has read already: storing it waits
+// for nothing.
+static bool writeBackArrived(const PendingWriteBack& w) {
+    return w.fetch && w.fetch->ready.load(std::memory_order_acquire) != 0;
+}
+
+// Stores the write-backs issued before this frame that have come back, and
+// any older (all of them with `all`). The previous frame's are often not
+// finished on the GPU yet when this frame ends; waiting for them kept the
+// game from starting the next frame while the GPU caught up, so they are
+// stored a frame later unless they are in already.
 static void resolveWriteBacks(bool all) {
     size_t keep = 0;
     for (size_t i = 0; i < s_writeBacks.size(); i++) {
         PendingWriteBack& w = s_writeBacks[i];
-        if (!all && !w.cancelled && w.frame >= s_frameNo) s_writeBacks[keep++] = w;
-        else resolveWriteBack(w);
+        const bool due = all || w.cancelled || w.frame + 1 < s_frameNo || (w.frame < s_frameNo && writeBackArrived(w));
+        if (due) resolveWriteBack(w);
+        else s_writeBacks[keep++] = w;
     }
     s_writeBacks.resize(keep);
 }
@@ -2439,13 +2524,17 @@ static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, 
     }
     // A copy to the same place supersedes one of this frame; one from an
     // earlier frame (most games copy to the same buffer every frame) is
-    // stored first, as the CPU may have read it in between.
+    // stored first, as the CPU may have read it in between: now if it has
+    // come back or is older than the previous frame, else it stays pending
+    // and is stored before this one (resolveWriteBacks keeps their order).
     size_t keep = 0;
     for (size_t i = 0; i < s_writeBacks.size(); i++) {
         PendingWriteBack& w = s_writeBacks[i];
         if (w.dest != dest) s_writeBacks[keep++] = w;
-        else if (w.frame < s_frameNo) resolveWriteBack(w);
-        else {
+        else if (w.frame < s_frameNo) {
+            if (w.frame + 1 < s_frameNo || writeBackArrived(w)) resolveWriteBack(w);
+            else s_writeBacks[keep++] = w;
+        } else {
             w.cancelled = true;
             resolveWriteBack(w);
         }
@@ -2462,8 +2551,8 @@ static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, 
     glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
     glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    PendingWriteBack w{dest, bytes, hashBytes(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
-                       readBytes, s_frameNo, false, nullptr};
+    PendingWriteBack w{dest,     bytes,     writeBackDestHash(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
+                       readBytes, s_frameNo, false, nullptr, writeClock()};
     s_writeBacks.push_back(w);
 }
 
@@ -2488,6 +2577,7 @@ static void prefetchWriteBacks() {
             bindPack(pbo, &prev);
             if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
                 memcpy(f->bytes.data(), px, n);
+                f->hash = hashBytes(f->bytes.data(), n);
                 f->ok = true;
                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             }

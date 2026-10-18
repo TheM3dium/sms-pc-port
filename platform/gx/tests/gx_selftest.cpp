@@ -609,6 +609,26 @@ int main(int argc, char** argv) {
         }
         GXSetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
         GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+
+        // A normal read is cumulative. The port's explicit scope end freezes
+        // the completed count, while a new clear restarts counting normally.
+        GXClearPixMetric();
+        colorQuad(100, 260, 140, 300, 255, 255, 255, 255);
+        GXReadPixMetric(&d, &d, &d, &d, &alone, &d);
+        colorQuad(200, 260, 240, 300, 255, 255, 255, 255);
+        GXReadPixMetric(&d, &d, &d, &d, &both, &d);
+        expect("pixel metric reads keep counting", both == alone * 2);
+        GXPC_EndPixMetric();
+        GXPC_EndPixMetric();
+        colorQuad(300, 260, 340, 300, 255, 255, 255, 255);
+        u32 stopped = 0;
+        GXReadPixMetric(&d, &d, &d, &d, &stopped, &d);
+        expect("completed metric scope excludes later draws", stopped == both);
+        GXClearPixMetric();
+        colorQuad(100, 260, 140, 300, 255, 255, 255, 255);
+        GXReadPixMetric(&d, &d, &d, &d, &stopped, &d);
+        expect("clear restarts a completed metric scope", stopped == alone);
+        GXPC_EndPixMetric();
     }
 
     // Copy clears must preserve disabled channels and alpha in RGB8. The

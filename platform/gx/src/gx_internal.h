@@ -205,6 +205,7 @@ uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
 uint32_t peekZ(int x, int y);      // 24-bit
 void pixMetricClear();
 uint32_t pixMetricRead();
+void pixMetricEnd();
 
 // ---------------------------------------------------------------- textures (gx_texture.cpp)
 struct TexKey;

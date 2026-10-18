@@ -99,6 +99,11 @@ void sms_gx_rumble_shutdown(void);
 int GXPC_Init(GXPCGetProcFn getProc, float efbScale);
 void GXPC_Shutdown(void);
 
+/* End a completed pixel-metric scope immediately after GXReadPixMetric.
+ * Later draws leave its last result unchanged until GXClearPixMetric starts
+ * the next scope. Ordinary GXReadPixMetric still keeps counting. */
+void GXPC_EndPixMetric(void);
+
 /* Before endian conversion, discover HD replacements in BTI, J3D TEX1 and
  * JPA resources. Thread-safe; hashes synchronously and keeps no game pointers.
  * PreloadTextures drains those requests on the GL thread before gameplay.
