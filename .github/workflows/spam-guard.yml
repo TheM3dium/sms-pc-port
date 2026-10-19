@@ -1,0 +1,120 @@
+name: Spam guard
+# Removes the "Easy Install / Easy Fix" malware spam: issues that tell people to
+# paste `iex(irm <domain>)` into an admin PowerShell, and the bursts of fake
+# praise comments that throwaway accounts post on them seconds later.
+#
+# Runs on every new or edited issue and comment. Issue events always run the
+# workflow from main, never from the spammer, and nothing they write is
+# executed: the text is only read from the event file and matched with grep.
+#
+# A spam issue is locked at once (so no more comments), and a spam comment is
+# deleted. With the SPAM_GUARD_TOKEN secret set (a fine-grained token of the
+# repository owner with Issues read and write on this repository, and the
+# account permission "Block another user" read and write), the issue is
+# deleted and its accounts blocked; without it, the issue's title and text are
+# replaced and it is closed.
+#
+# Only accounts younger than 180 days are deleted or blocked: the spam accounts
+# were two weeks old. From an older account, which is more likely a real person
+# quoting an installer command, the issue is locked, replaced and closed (its
+# edit history keeps the original) and a comment is hidden as spam instead.
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+permissions:
+  issues: write
+  pull-requests: write
+jobs:
+  guard:
+    # People with a history here (owner, collaborators, anyone with a merged
+    # pull request) are never checked.
+    if: >-
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'),
+      github.event.comment.author_association || github.event.issue.author_association)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Remove spam and block its accounts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ADMIN_TOKEN: ${{ secrets.SPAM_GUARD_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Runs locally against a saved event with DRY_RUN=1, printing the
+          # calls instead of making them.
+          api() { if [[ -n "${DRY_RUN:-}" ]]; then echo "DRY_RUN: $*"; else "$@"; fi; }
+          ev() { jq -r "$1 // empty" "$GITHUB_EVENT_PATH"; }
+
+          # The lure: a PowerShell download-and-run one-liner, or this
+          # campaign's own titles and domain. Matching any one is enough.
+          spam_text() {
+            grep -qiE \
+              -e 'iex[[:space:]]*\([[:space:]]*(irm|iwr|invoke-restmethod|invoke-webrequest)\b' \
+              -e '\b(irm|iwr)\b[^|]*\|[[:space:]]*iex\b' \
+              -e 'invoke-expression' \
+              -e 'gitrm\.' \
+              -e '✅[[:space:]]*\[easy (install|fix)\]' \
+              -e '^Removed: malware spam$'
+          }
+
+          number=$(ev .issue.number)
+          issue_text="$(ev .issue.title)"$'\n'"$(ev .issue.body)"
+          issue_is_spam=false
+          printf '%s' "$issue_text" | spam_text && issue_is_spam=true
+
+          # Accounts younger than 180 days get deleted and blocked.
+          young() {
+            local created
+            created=$(gh api "users/$1" --jq .created_at 2>/dev/null) || return 1
+            (( $(date -d "$created" +%s) > $(date -d '180 days ago' +%s) ))
+          }
+
+          block() {
+            [[ -n "$ADMIN_TOKEN" ]] || return 0
+            echo "Blocking $1"
+            GH_TOKEN="$ADMIN_TOKEN" api gh api -X PUT "user/blocks/$1" --silent 2>&1 \
+              | grep -v 'already been blocked' || true
+          }
+
+          if [[ "$GITHUB_EVENT_NAME" == issues ]]; then
+            $issue_is_spam || { echo "Issue #$number is not spam."; exit 0; }
+            author=$(ev .issue.user.login)
+            echo "Issue #$number by $author is spam."
+            # Lock first: the fake praise comments arrive within seconds.
+            api gh api -X PUT "repos/$REPO/issues/$number/lock" -f lock_reason=spam --silent || true
+            young=false
+            young "$author" && young=true && block "$author"
+            if $young && [[ -n "$ADMIN_TOKEN" ]] && GH_TOKEN="$ADMIN_TOKEN" api gh api graphql \
+                -f query='mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}' \
+                -f id="$(ev .issue.node_id)" --silent; then
+              echo "Deleted issue #$number."
+            else
+              # Not deleting: take the command down and close it.
+              api gh api -X PATCH "repos/$REPO/issues/$number" --silent \
+                -f title='Removed: malware spam' -f body='Removed automatically: this issue was malware spam.' \
+                -f state=closed -f state_reason=not_planned
+              echo "Replaced and closed issue #$number."
+            fi
+            exit 0
+          fi
+
+          # A comment: spam if it carries the lure itself, or if it sits on a
+          # spam issue (the fake praise has no lure of its own).
+          comment_is_spam=$issue_is_spam
+          printf '%s' "$(ev .comment.body)" | spam_text && comment_is_spam=true
+          $comment_is_spam || { echo "Comment on #$number is not spam."; exit 0; }
+          author=$(ev .comment.user.login)
+          echo "Comment $(ev .comment.id) by $author on #$number is spam."
+          if young "$author"; then
+            block "$author"
+            # The issue may already be deleted, taking the comment with it.
+            api gh api -X DELETE "repos/$REPO/issues/comments/$(ev .comment.id)" --silent 2>&1 \
+              | grep -v 'Not Found' || true
+          else
+            api gh api graphql --silent \
+              -f query='mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:SPAM}){clientMutationId}}' \
+              -f id="$(ev .comment.node_id)" || true
+          fi
