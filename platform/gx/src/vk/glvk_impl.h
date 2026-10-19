@@ -399,6 +399,7 @@ bool renderingActive();
 void onSegmentStart();  // a new main command buffer: forget what was bound in the last
 void beforeSubmit();    // ends rendering and the open query piece
 bool realizeTexture(Texture* t);
+void realizePending();  // makes the images of textures still holding uploads
 void destroyBuffer(Buffer* b);
 
 // ------------------------------------------------------------------ shaders (glvk_shader.cpp)

@@ -43,6 +43,9 @@ static bool allocBuffer(Buffer* b, VkDeviceSize size, bool readback) {
     bci.size = std::max<VkDeviceSize>(size, 16);
     bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    // System memory: the renderer writes its persistently mapped buffers in
+    // many small pieces, which video memory the CPU can write (the BAR) takes
+    // several times as long.
     VmaAllocationCreateInfo aci{};
     aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | (readback ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
@@ -314,6 +317,22 @@ static void packRows(const void* pixels, uint32_t w, uint32_t h, uint32_t bpp, s
         for (uint32_t y = 0; y < h; y++) memcpy(out.data() + row * y, src + pitch * y, row);
 }
 
+// Textures holding uploads until their image is made (their levels known):
+// made at the end of the frame, or at once when they hold over 64 MiB, so
+// the copies do not pile up in memory (a texture pack sends hundreds of
+// replacements before any of them is drawn).
+static std::vector<GLuint> s_pendingTex;
+static size_t s_pendingBytes = 0;
+
+void realizePending() {
+    std::vector<GLuint> names;
+    names.swap(s_pendingTex);
+    s_pendingBytes = 0;
+    for (GLuint n : names)
+        if (Texture* t = g_textures.get(n))
+            if (!t->pending.empty()) realizeTexture(t);
+}
+
 static void storeLevel(Texture* t, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h, std::vector<uint8_t>&& data) {
     if (t->img && level < t->img->levels && t->img->format == t->format) {
         uploadRegion(t->img, level, x, y, w, h, data.data(), data.size());
@@ -325,7 +344,10 @@ static void storeLevel(Texture* t, uint32_t level, uint32_t x, uint32_t y, uint3
         t->pending.erase(std::remove_if(t->pending.begin(), t->pending.end(),
                                         [level](const Texture::Pending& p) { return p.level == level; }),
                          t->pending.end());
+    if (t->pending.empty() && S.activeUnit < kMaxUnits) s_pendingTex.push_back(S.textures[S.activeUnit]);
+    s_pendingBytes += data.size();
     t->pending.push_back(Texture::Pending{level, x, y, w, h, std::move(data)});
+    if (s_pendingBytes > (size_t(64) << 20)) realizePending();
 }
 
 void texImage2D(GLint level, GLint ifmt, GLsizei w, GLsizei h, GLenum format, GLenum type, const void* pixels, bool compressed,

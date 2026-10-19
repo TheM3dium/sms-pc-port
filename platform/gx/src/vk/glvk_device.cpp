@@ -432,6 +432,22 @@ static void statsFrame() {
     logmsg("Vulkan stats: %.1f submits/frame (%.2f ms), %.2f ms/frame waiting for the GPU, %.0f draws/frame, "
            "%.1f render passes/frame, %u pipelines made", g_stats.submits / f, g_stats.submitSeconds * 1000.0 / f,
            g_stats.waitSeconds * 1000.0 / f, g_stats.draws / f, g_stats.renderPasses / f, g_stats.pipelines);
+    {
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(D.vma, budgets);
+        const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+        vmaGetMemoryProperties(D.vma, &mp);
+        size_t ring[2] = {0, 0};
+        for (int r = 0; r < 2; r++)
+            for (const Ring::Block& b : (r ? g_dynamic : g_staging).blocks) ring[r] += size_t(b.size);
+        char heaps[256];
+        int len = 0;
+        for (uint32_t h = 0; h < mp->memoryHeapCount && len < 200; h++)
+            len += snprintf(heaps + len, sizeof heaps - size_t(len), "%s%s %zu MiB", h ? ", " : "",
+                            (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "device" : "host",
+                            size_t(budgets[h].statistics.allocationBytes >> 20));
+        logmsg("Vulkan memory: %s; staging ring %zu MiB, dynamic ring %zu MiB", heaps, ring[0] >> 20, ring[1] >> 20);
+    }
     const uint32_t pipelines = g_stats.pipelines;
     g_stats = Stats();
     g_stats.pipelines = pipelines;
@@ -486,7 +502,9 @@ RingAlloc Ring::alloc(VkDeviceSize bytes, VkDeviceSize align) {
         bci.usage = usage;
         VmaAllocationCreateInfo aci{};
         aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        // its own memory, given back when the block is let go after a burst
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                    VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
         VmaAllocationInfo info{};
         if (vmaCreateBuffer(D.vma, &bci, &aci, &b.buf, &b.alloc, &info) != VK_SUCCESS) {
             logmsg("Vulkan: out of host memory for a %zu KiB ring block", size_t(b.size >> 10));
@@ -498,9 +516,9 @@ RingAlloc Ring::alloc(VkDeviceSize bytes, VkDeviceSize align) {
     }
     // blocks past the first few that are free and not this one: let them go
     // (a texture pack's burst of uploads should not keep its staging forever)
-    if (blocks.size() > 6) {
+    if (blocks.size() > 2) {
         for (size_t i = 0; i < blocks.size();) {
-            if (int(i) != pick && int(i) != cur && serialDone(blocks[i].serial) && blocks.size() > 6) {
+            if (int(i) != pick && int(i) != cur && serialDone(blocks[i].serial) && blocks.size() > 2) {
                 vmaDestroyBuffer(D.vma, blocks[i].buf, blocks[i].alloc);
                 blocks.erase(blocks.begin() + long(i));
                 if (pick > int(i)) pick--;
@@ -999,6 +1017,9 @@ bool init(const InitInfo& info) {
     vci.device = D.dev;
     vci.instance = D.instance;
     vci.pVulkanFunctions = &vf;
+    // 32 MiB blocks (VMA's default is 256): the host-visible ones are system
+    // memory the process keeps while any allocation in them lives
+    vci.preferredLargeHeapBlockSize = VkDeviceSize(32) << 20;
     if (vmaCreateAllocator(&vci, &D.vma) != VK_SUCCESS) {
         logmsg("Vulkan: the memory allocator failed to start");
         shutdown();
@@ -1187,6 +1208,7 @@ void setSwapInterval(int vsync) {
 bool presentFrame() {
     s_presents++;
     statsFrame();
+    realizePending();
     if ((s_presents & 1023) == 0) savePipelineCache(false);
     if (!s_sc.surface) {  // headless: submit, keeping as many frames in flight as with a window
         submit();
