@@ -11,6 +11,10 @@ are compared exactly: per field, the pixels that differ, the largest channel
 difference, and an image (--out) of OpenGL | Vulkan | the difference x16.
 Exits 1 when any field differs (or with --tolerance, differs by more).
 
+--against EXE compares OpenGL with OpenGL instead: --exe's pictures with
+those of another build (e.g. one of main, to check a change draws nothing
+differently).
+
 Runs are one at a time under a memory cap (systemd-run --user, when there),
 and their captures are deleted unless --keep is given. --window runs both in
 a window (macOS, which has no headless OpenGL).
@@ -45,8 +49,8 @@ def read_ppm(path):
     return Image.open(path).convert('RGB')
 
 
-def run_once(exe, disc, spec, backend, work, timeout, mem):
-    d = os.path.join(work, backend)
+def run_once(exe, disc, spec, backend, work, timeout, mem, label=None):
+    d = os.path.join(work, label or backend)
     shutil.rmtree(d, ignore_errors=True)
     shots, save = os.path.join(d, 'shots'), os.path.join(d, 'save')
     os.makedirs(shots)
@@ -144,8 +148,11 @@ def main():
     ap.add_argument('--mem', default='2500M', help='memory cap per run (systemd-run), "" for none')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for both runs')
     ap.add_argument('--window', action='store_true', help='run in a window instead of headless (macOS)')
+    ap.add_argument('--against', default=None, help='compare OpenGL with this build\'s OpenGL instead of Vulkan')
     args = ap.parse_args()
     args.exe = os.path.abspath(args.exe)
+    if args.against:
+        args.against = os.path.abspath(args.against)
     global WINDOW
     WINDOW = args.window
     for kv in args.env:
@@ -163,9 +170,13 @@ def main():
                 sys.exit('unknown run %r (one of %s)' % (name, ', '.join(k for k, v in RUNS.items() if v.get('shots'))))
             rw = os.path.join(work, name)
             gl, gl_ok, gl_s = run_once(args.exe, disc, spec, 'opengl', rw, spec['timeout'], args.mem)
-            vk, vk_ok, vk_s = run_once(args.exe, disc, spec, 'vulkan', rw, spec['timeout'], args.mem)
-            print('%s: OpenGL %s in %.0f s, Vulkan %s in %.0f s' % (name, 'done' if gl_ok else 'INCOMPLETE', gl_s,
-                                                                    'done' if vk_ok else 'INCOMPLETE', vk_s))
+            if args.against:
+                vk, vk_ok, vk_s = run_once(args.against, disc, spec, 'opengl', rw, spec['timeout'], args.mem, 'against')
+            else:
+                vk, vk_ok, vk_s = run_once(args.exe, disc, spec, 'vulkan', rw, spec['timeout'], args.mem)
+            print('%s: OpenGL %s in %.0f s, %s %s in %.0f s' % (name, 'done' if gl_ok else 'INCOMPLETE', gl_s,
+                                                              'the other build' if args.against else 'Vulkan',
+                                                              'done' if vk_ok else 'INCOMPLETE', vk_s))
             ok = compare(gl, vk, spec['shots'], args.out, name, args.tolerance) and ok and gl_ok and vk_ok
     finally:
         if args.keep:

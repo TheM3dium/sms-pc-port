@@ -125,36 +125,81 @@ endif()
 # The optional Vulkan backend (src/vk, SMS_GX_BACKEND=vulkan): the GL subset
 # the renderer draws with, on Vulkan. The Vulkan loader is opened at run time
 # (volk), so the game still starts where there is none and falls back to GL.
-# Its dependencies are fetched at configure time (FETCHCONTENT_SOURCE_DIR_<NAME>
-# points one at a local copy instead); -DSMS_GX_VULKAN=OFF builds without it.
-option(SMS_GX_VULKAN "Build the optional Vulkan backend" ON)
-if(SMS_GX_VULKAN)
-    include(FetchContent)
-    if(POLICY CMP0169)
-        cmake_policy(SET CMP0169 OLD)  # FetchContent_Populate of declared, header-only sources
+# On by default on Linux, where it is tested; -DSMS_GX_VULKAN=ON elsewhere.
+# Its dependencies are downloaded at configure time (or taken from the
+# tarballs in SMS_GX_VULKAN_DEPS); if one cannot be had, the game is built
+# without the backend, as before it existed, and configure only warns.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_sms_vulkan_default ON)
+else()
+    set(_sms_vulkan_default OFF)
+endif()
+option(SMS_GX_VULKAN "Build the optional Vulkan backend" ${_sms_vulkan_default})
+set(SMS_GX_VULKAN_DEPS "" CACHE PATH "Folder with the Vulkan backend's dependency tarballs (offline builds)")
+
+# Sets <var> to the extracted source folder of tarball <file> (sha256 <hash>)
+# from <url>, or to "" when it cannot be had.
+function(sms_gx_fetch var file url hash)
+    set(${var} "" PARENT_SCOPE)
+    set(_root ${CMAKE_BINARY_DIR}/_vkdeps)
+    set(_dir ${_root}/${file}.d)
+    if(EXISTS ${_dir}/.ok)
+        file(GLOB _top LIST_DIRECTORIES true ${_dir}/*)
+        list(FILTER _top EXCLUDE REGEX "/\\.ok$")
+        set(${var} ${_top} PARENT_SCOPE)
+        return()
     endif()
-    FetchContent_Declare(sms_vulkan_headers
-        URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.296.tar.gz
-        URL_HASH SHA256=e204e0b3c19f622d197df945737f5db913d6621830999b8578d34e80a7c90585
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    FetchContent_Declare(sms_volk
-        URL https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.3.296.0.tar.gz
-        URL_HASH SHA256=8ffd0e81e29688f4abaa39e598937160b098228f37503903b10d481d4862ab85
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    FetchContent_Declare(sms_vma
-        URL https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.1.0.tar.gz
-        URL_HASH SHA256=ae134ecc37c55634f108e926f85d5d887b670360e77cd107affaf3a9539595f2
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    FetchContent_Declare(sms_glslang
-        URL https://github.com/KhronosGroup/glslang/archive/refs/tags/15.0.0.tar.gz
-        URL_HASH SHA256=c31c8c2e89af907507c0631273989526ee7d5cdf7df95ececd628fd7b811e064
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    foreach(_dep sms_vulkan_headers sms_volk sms_vma)
-        FetchContent_GetProperties(${_dep})
-        if(NOT ${_dep}_POPULATED)
-            FetchContent_Populate(${_dep})
+    set(_tar ${_root}/${file})
+    if(SMS_GX_VULKAN_DEPS AND EXISTS ${SMS_GX_VULKAN_DEPS}/${file})
+        set(_tar ${SMS_GX_VULKAN_DEPS}/${file})
+    else()
+        file(DOWNLOAD ${url} ${_tar} STATUS _status TIMEOUT 120 INACTIVITY_TIMEOUT 30)
+        list(GET _status 0 _code)
+        if(NOT _code EQUAL 0)
+            message(WARNING "sms_gx: could not download ${url} (${_status})")
+            file(REMOVE ${_tar})
+            return()
         endif()
-    endforeach()
+    endif()
+    file(SHA256 ${_tar} _got)
+    if(NOT _got STREQUAL hash)
+        message(WARNING "sms_gx: ${file} does not match its checksum")
+        return()
+    endif()
+    file(REMOVE_RECURSE ${_dir})
+    file(ARCHIVE_EXTRACT INPUT ${_tar} DESTINATION ${_dir})
+    file(GLOB _top LIST_DIRECTORIES true ${_dir}/*)
+    list(LENGTH _top _n)
+    if(NOT _n EQUAL 1)
+        message(WARNING "sms_gx: ${file} did not extract as expected")
+        return()
+    endif()
+    file(TOUCH ${_dir}/.ok)
+    if(_tar STREQUAL ${_root}/${file})
+        file(REMOVE ${_tar})
+    endif()
+    set(${var} ${_top} PARENT_SCOPE)
+endfunction()
+
+if(SMS_GX_VULKAN)
+    sms_gx_fetch(_vk_headers vulkan-headers-1.3.296.tar.gz
+        https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.296.tar.gz
+        e204e0b3c19f622d197df945737f5db913d6621830999b8578d34e80a7c90585)
+    sms_gx_fetch(_vk_volk volk-1.3.296.0.tar.gz
+        https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.3.296.0.tar.gz
+        8ffd0e81e29688f4abaa39e598937160b098228f37503903b10d481d4862ab85)
+    sms_gx_fetch(_vk_vma vma-3.1.0.tar.gz
+        https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.1.0.tar.gz
+        ae134ecc37c55634f108e926f85d5d887b670360e77cd107affaf3a9539595f2)
+    sms_gx_fetch(_vk_glslang glslang-15.0.0.tar.gz
+        https://github.com/KhronosGroup/glslang/archive/refs/tags/15.0.0.tar.gz
+        c31c8c2e89af907507c0631273989526ee7d5cdf7df95ececd628fd7b811e064)
+    if(NOT _vk_headers OR NOT _vk_volk OR NOT _vk_vma OR NOT _vk_glslang)
+        message(WARNING "sms_gx: building without the Vulkan backend (its dependencies could not be had); the game draws with OpenGL")
+        set(SMS_GX_VULKAN OFF)
+    endif()
+endif()
+if(SMS_GX_VULKAN)
     # glslang: the GLSL front end and SPIR-V back end only
     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
     set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
@@ -167,20 +212,18 @@ if(SMS_GX_VULKAN)
     set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
     set(_sms_shared ${BUILD_SHARED_LIBS})
     set(BUILD_SHARED_LIBS OFF)
-    FetchContent_GetProperties(sms_glslang)
-    if(NOT sms_glslang_POPULATED)
-        FetchContent_Populate(sms_glslang)
-        add_subdirectory(${sms_glslang_SOURCE_DIR} ${sms_glslang_BINARY_DIR} EXCLUDE_FROM_ALL)
+    if(NOT TARGET glslang)
+        add_subdirectory(${_vk_glslang} ${CMAKE_BINARY_DIR}/_vkdeps/glslang-build EXCLUDE_FROM_ALL)
     endif()
     set(BUILD_SHARED_LIBS ${_sms_shared})
     target_sources(sms_gx PRIVATE src/vk/glvk_device.cpp src/vk/glvk_draw.cpp src/vk/glvk_objects.cpp
-                   src/vk/glvk_shader.cpp src/vk/glvk_vma.cpp ${sms_volk_SOURCE_DIR}/volk.c)
-    target_include_directories(sms_gx PRIVATE src/vk ${sms_vulkan_headers_SOURCE_DIR}/include ${sms_volk_SOURCE_DIR}
-                               ${sms_vma_SOURCE_DIR}/include ${sms_glslang_SOURCE_DIR})
+                   src/vk/glvk_shader.cpp src/vk/glvk_vma.cpp ${_vk_volk}/volk.c)
+    target_include_directories(sms_gx PRIVATE src/vk ${_vk_headers}/include ${_vk_volk}
+                               ${_vk_vma}/include ${_vk_glslang})
     target_compile_definitions(sms_gx PRIVATE SMS_GX_HAVE_VULKAN=1 VK_NO_PROTOTYPES=1)
     target_link_libraries(sms_gx PRIVATE glslang SPIRV glslang-default-resource-limits ${CMAKE_DL_LIBS})
     # third-party code keeps its own warnings
-    set_source_files_properties(src/vk/glvk_vma.cpp ${sms_volk_SOURCE_DIR}/volk.c PROPERTIES COMPILE_OPTIONS "-w")
+    set_source_files_properties(src/vk/glvk_vma.cpp ${_vk_volk}/volk.c PROPERTIES COMPILE_OPTIONS "-w")
     message(STATUS "sms_gx: Vulkan backend (SMS_GX_BACKEND=vulkan)")
 endif()
 

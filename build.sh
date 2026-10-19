@@ -12,7 +12,8 @@
 # JOBS=n limits parallel compiler jobs. SMS_ECLIPSE=1 builds Super Mario
 # Eclipse in, into build/<os>-<arch>-eclipse/ (docs/ECLIPSE.md). See BUILD.md.
 # SMS_GX_BUILD_TESTS=ON also configures platform/gx's self-tests (for CI).
-# SMS_GX_VULKAN=OFF leaves out the optional Vulkan backend (docs/VULKAN.md).
+# SMS_GX_VULKAN=ON|OFF builds the optional Vulkan backend in or leaves it out
+# (default: on Linux only; docs/VULKAN.md).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -90,27 +91,32 @@ setup_macos() {
     hdiutil detach "$mnt" -quiet || true
   fi
 
-  # MoltenVK, the Vulkan backend's library on macOS (renderer = vulkan): beside
-  # the executable and in SMS.app's Frameworks. A universal dylib; build/deps/
-  # keeps it. SMS_GX_VULKAN=OFF builds without the backend and skips it.
+  # MoltenVK, the Vulkan backend's library on macOS (renderer = vulkan), with
+  # SMS_GX_VULKAN=ON: beside the executable and in SMS.app's Frameworks. A
+  # universal dylib; build/deps/ keeps it. Without it the game uses OpenGL.
   local mvk_ver=1.4.2
   local mvk_sha=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
   mvk_dylib=""
-  if [[ "${SMS_GX_VULKAN:-ON}" != OFF ]]; then
+  if [[ "${SMS_GX_VULKAN:-}" == ON ]]; then
     mvk_dylib="$PWD/build/deps/MoltenVK-$mvk_ver/libMoltenVK.dylib"
     if [[ ! -f "$mvk_dylib" ]]; then
       echo "Fetching MoltenVK $mvk_ver into build/deps/ ..."
       mkdir -p "build/deps/MoltenVK-$mvk_ver"
       local tar="build/deps/MoltenVK-$mvk_ver.tar"
-      curl -fsSL -o "$tar.part" "https://github.com/KhronosGroup/MoltenVK/releases/download/v$mvk_ver/MoltenVK-macos.tar"
-      echo "$mvk_sha  $tar.part" | shasum -a 256 -c - >/dev/null || sms_die "MoltenVK download does not match its checksum"
-      tar -xf "$tar.part" -C "build/deps/MoltenVK-$mvk_ver" --strip-components 5 \
-        MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
-      tar -xf "$tar.part" -C "build/deps/MoltenVK-$mvk_ver" --strip-components 1 MoltenVK/LICENSE
+      if curl -fsSL -o "$tar.part" "https://github.com/KhronosGroup/MoltenVK/releases/download/v$mvk_ver/MoltenVK-macos.tar" &&
+         echo "$mvk_sha  $tar.part" | shasum -a 256 -c - >/dev/null; then
+        tar -xf "$tar.part" -C "build/deps/MoltenVK-$mvk_ver" --strip-components 5 \
+          MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib || true
+        tar -xf "$tar.part" -C "build/deps/MoltenVK-$mvk_ver" --strip-components 1 MoltenVK/LICENSE || true
+      fi
       rm -f "$tar.part"
-      [[ -f "$mvk_dylib" ]] || sms_die "MoltenVK $mvk_ver: libMoltenVK.dylib not found in the download"
     fi
-    cmake_args+=(-DSMS_MOLTENVK_DYLIB="$mvk_dylib")
+    if [[ -f "$mvk_dylib" ]]; then
+      cmake_args+=(-DSMS_MOLTENVK_DYLIB="$mvk_dylib")
+    else
+      echo "warning: could not fetch MoltenVK $mvk_ver; renderer = vulkan will fall back to OpenGL" >&2
+      mvk_dylib=""
+    fi
   fi
 
   # A CMake tree configured for another architecture cannot be reused.
@@ -133,9 +139,9 @@ setup_windows() {
 }
 
 "setup_$sms_os"
-# SMS_GX_VULKAN=OFF: no Vulkan backend (it needs its dependencies fetched at
-# configure time; renderer = vulkan then falls back to OpenGL)
-[[ "${SMS_GX_VULKAN:-ON}" != OFF ]] || cmake_args+=(-DSMS_GX_VULKAN=OFF)
+# SMS_GX_VULKAN=ON|OFF overrides the Vulkan backend's default (on Linux only);
+# without it, renderer = vulkan falls back to OpenGL
+[[ -z "${SMS_GX_VULKAN:-}" ]] || cmake_args+=(-DSMS_GX_VULKAN="$SMS_GX_VULKAN")
 
 disc="${1:-${SMS_DISC_IMAGE:-}}"
 [[ -n "$disc" || "$eclipse" == 1 ]] || disc=$(sms_find_rom)
