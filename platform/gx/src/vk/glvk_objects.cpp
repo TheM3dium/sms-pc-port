@@ -45,13 +45,10 @@ static bool allocBuffer(Buffer* b, VkDeviceSize size, bool readback) {
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     // System memory: the renderer writes its persistently mapped buffers in
     // many small pieces, which video memory the CPU can write (the BAR) takes
-    // several times as long.
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-    aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | (readback ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-                                                             : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-    if (readback) aci.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-    else aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // several times as long. Small ones share 16 MiB blocks.
+    VmaAllocationCreateInfo aci = hostBufferAllocInfo(readback);
+    if (size <= (VkDeviceSize(4) << 20)) aci.pool = D.hostPools[readback ? 1 : 0];
+    else aci.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(D.vma, &bci, &aci, &b->buf, &b->alloc, &info) != VK_SUCCESS) {
         logmsg("Vulkan: could not make a %zu KiB buffer", size_t(size >> 10));

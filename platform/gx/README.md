@@ -38,10 +38,11 @@ The renderer reads its state only from that register file, so API calls, GD disp
 | `src/gx_shader.cpp` | Generates GLSL from the register state. The vertex shader covers position/normal matrices, the GX projection and viewport, texgen (regular, post-transform/dual-tex, colour, approximate emboss) and lighting (8 lights, diffuse/spot/specular attenuation). The fragment shader covers up to 16 TEV stages in integer math, swap tables, konst selection, compare modes, 4 indirect stages, alpha compare and fog. Programs are cached by the state bytes that shape the code. |
 | `src/gx_texture.cpp` | Decoders for I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CMPR, C4, C8 and C14X2 with IA8/RGB565/RGB5A3 TLUTs. The GL texture cache is keyed by address, format, size, mip levels and TLUT, and content hashes are re-checked after an invalidate. |
 | `src/gx_render.cpp` | EFB as an FBO (640×528 × scale). Batches primitives (quads, strips and fans become triangle lists). Maps blend, logic-op, depth, cull, scissor, colour/alpha-update and dst-alpha state. Handles EFB copies (display copies become XFB textures; texture copies go through a format-converting pass that includes intensity/YUV, R/G/B/A/RG/GB and Z formats), XFB presentation and EFB peeks. |
-| `src/gx_platform.cpp` | Creates the SDL2 window or headless EGL context, presents on `GXCopyDisp`, pumps events and handles the command-line and environment switches |
+| `src/gx_platform.cpp` | Creates the SDL2 window (OpenGL, or Vulkan with `SMS_GX_BACKEND=vulkan`) or headless EGL context, presents on `GXCopyDisp`, pumps events and handles the command-line and environment switches |
 | `src/gx_glthread.cpp` | The GL thread and its command queue; `src/gl_loader.cpp` turns the GL entry points into proxies that queue work for it |
 | `src/gx_vert.cpp` | `GXPosition3f32` and the other vertex writers as real functions |
 | `src/gl_loader.cpp` | Loads the GL 3.3 entry points through the host's get-proc function, so nothing links against libGL |
+| `src/vk/` | glvk, the optional Vulkan backend: the GL subset above implemented on Vulkan (`SMS_GX_BACKEND=vulkan`, [docs/VULKAN.md](../../docs/VULKAN.md)); `gx_platform.cpp` hands `GXPC_Init` its get-proc function instead of SDL's or EGL's |
 | decomp `libs/dolphin/src/gd/*.c` | GD, compiled unchanged from the decompiled SDK with `src/gd_host_prefix.h` force-included |
 
 ## Integration (for the bring-up lead)

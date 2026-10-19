@@ -21,7 +21,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace glvk {
 
@@ -282,58 +293,73 @@ bool makeModules(Program* p) {
 }  // namespace
 
 void destroyProgramObjects(Program* p) {
+    programLibraries(p);
     std::vector<VkPipeline> pipes;
     for (auto& kv : p->pipelines) pipes.push_back(kv.second);
     p->pipelines.clear();
+    for (VkPipeline& l : p->libPre) pipes.push_back(l), l = VK_NULL_HANDLE;
+    for (VkPipeline& l : p->libFrag) pipes.push_back(l), l = VK_NULL_HANDLE;
     VkShaderModule mods[3] = {p->modules[0], p->modules[1], p->modules[2]};
     for (VkShaderModule& m : p->modules) m = VK_NULL_HANDLE;
     deferDelete([pipes, mods] {
-        for (VkPipeline pl : pipes) vkDestroyPipeline(D.dev, pl, nullptr);
+        for (VkPipeline pl : pipes)
+            if (pl) vkDestroyPipeline(D.dev, pl, nullptr);
         for (VkShaderModule m : mods)
             if (m) vkDestroyShaderModule(D.dev, m, nullptr);
     });
 }
 
-bool linkProgram(Program* p) {
-    if (!s_glslangReady) {
-        glslang::InitializeProcess();
-        s_glslangReady = true;
-    }
-    destroyProgramObjects(p);
-    p->linked = false;
-    p->log.clear();
-    p->uniforms.clear();
-    p->blockNames.clear();
-    p->blockSizes.clear();
-    p->defaultBlock.clear();
-    p->inputMask = p->inputInteger = p->samplerMask = 0;
-    p->hasGeometry = false;
-    for (auto& s : p->spirv) s.clear();
-    if (!p->id) p->id = s_nextProgramId++;
+// ------------------------------------------------------------------ linking
+// A program's GLSL, taken at glLinkProgram (its shaders may be deleted right
+// after), and what compiling it makes. Compiling touches nothing of the GL
+// state, so it can run on a worker thread (GL_KHR_parallel_shader_compile).
+struct LinkInputs {
+    std::string src[3];  // vertex, geometry, fragment; empty if missing
+    std::unordered_map<std::string, int> attribs;
+};
+struct LinkOutput {
+    bool ok = false;
+    std::string log;
+    std::vector<uint32_t> spirv[3];
+    VkShaderModule modules[3] = {};
+    std::vector<UniformInfo> uniforms;
+    std::vector<std::string> blockNames;
+    std::vector<int> blockSizes;
+    int defaultSize = 0;
+    uint32_t inputMask = 0, inputInteger = 0, samplerMask = 0;
+    bool hasGeometry = false;
+};
+struct LinkJob {
+    LinkInputs in;
+    LinkOutput out;
+    std::atomic<int> state{0};  // 0 waiting, 1 compiling, 2 compiled
+    // the pipeline library parts, made after the compile on the same thread
+    // (so a link is done, and the warm-up goes on, before they are)
+    std::atomic<int> libState{0};  // 0 not yet, 1 made (or not to be made)
+    VkPipeline libPre[2] = {}, libFrag[4] = {};
+    std::mutex m;
+    std::condition_variable cv;
+};
 
-    const Shader* stages[3] = {nullptr, nullptr, nullptr};
-    for (GLuint n : p->shaders) {
-        const Shader* sh = g_shaders.get(n);
-        if (!sh) continue;
-        if (sh->type == GL_VERTEX_SHADER) stages[0] = sh;
-        else if (sh->type == GL_GEOMETRY_SHADER) stages[1] = sh;
-        else if (sh->type == GL_FRAGMENT_SHADER) stages[2] = sh;
-    }
-    if (!stages[0] || !stages[2]) {
-        p->log = "glvk: a program needs a vertex and a fragment shader";
-        return false;
+namespace {
+
+std::atomic<bool> s_toldLines{false};
+
+void compileLink(const LinkInputs& in, LinkOutput& o) {
+    bool present[3] = {!in.src[0].empty(), !in.src[1].empty(), !in.src[2].empty()};
+    if (!present[0] || !present[2]) {
+        o.log = "glvk: a program needs a vertex and a fragment shader";
+        return;
     }
     bool lineFallback = false;
-    if (stages[1] && !D.features.geometryShader) {
+    if (present[1] && !D.features.geometryShader) {
         // no geometry shaders (MoltenVK): wide lines are drawn as plain
         // 1-pixel lines, by the vertex and fragment shaders alone
-        static bool told = false;
-        if (!told) logmsg("glvk: no geometry shaders: wide lines are drawn 1 pixel wide");
-        told = true;
-        stages[1] = nullptr;
+        if (!s_toldLines.exchange(true)) logmsg("glvk: no geometry shaders: wide lines are drawn 1 pixel wide");
+        present[1] = false;
         lineFallback = true;
     }
-    p->hasGeometry = stages[1] != nullptr;
+    o.hasGeometry = present[1];
     static const EShLanguage kLang[3] = {EShLangVertex, EShLangGeometry, EShLangFragment};
     const EShMessages msgs = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
     glslang::TShader* shaders[3] = {nullptr, nullptr, nullptr};
@@ -341,8 +367,8 @@ bool linkProgram(Program* p) {
     glslang::TProgram program;
     bool ok = true;
     for (int s = 0; s < 3 && ok; s++) {
-        if (!stages[s]) continue;
-        srcs[s] = prepare(stages[s]->source, kLang[s], p->hasGeometry, lineFallback);
+        if (!present[s]) continue;
+        srcs[s] = prepare(in.src[s], kLang[s], o.hasGeometry, lineFallback);
         shaders[s] = new glslang::TShader(kLang[s]);
         const char* str = srcs[s].c_str();
         shaders[s]->setStrings(&str, 1);
@@ -356,18 +382,18 @@ bool linkProgram(Program* p) {
         shaders[s]->setGlobalUniformSet(0);
         shaders[s]->setGlobalUniformBinding(B_DEFAULT_UBO);
         if (!shaders[s]->parse(GetDefaultResources(), 330, ECoreProfile, false, false, msgs)) {
-            p->log += std::string("compile: ") + shaders[s]->getInfoLog() + "\n--- source ---\n" + srcs[s];
+            o.log += std::string("compile: ") + shaders[s]->getInfoLog() + "\n--- source ---\n" + srcs[s];
             ok = false;
             break;
         }
         program.addShader(shaders[s]);
     }
     if (ok && !program.link(msgs)) {
-        p->log += std::string("link: ") + program.getInfoLog();
+        o.log += std::string("link: ") + program.getInfoLog();
         ok = false;
     }
     if (ok && !program.mapIO()) {
-        p->log += std::string("mapIO: ") + program.getInfoLog();
+        o.log += std::string("mapIO: ") + program.getInfoLog();
         ok = false;
     }
     if (ok) program.buildReflection(EShReflectionDefault);
@@ -376,20 +402,19 @@ bool linkProgram(Program* p) {
     // lists only the live ones), and the bindings are planned from it
     SpvInfo infos[3];
     for (int s = 0; ok && s < 3; s++) {
-        if (!stages[s]) continue;
+        if (!present[s]) continue;
         glslang::SpvOptions opt;
         opt.generateDebugInfo = false;
         opt.disableOptimizer = true;
         opt.validate = false;
-        glslang::GlslangToSpv(*program.getIntermediate(kLang[s]), p->spirv[s], &opt);
-        if (!scanSpirv(p->spirv[s], infos[s])) {
-            p->log += "glvk: unreadable SPIR-V\n";
+        glslang::GlslangToSpv(*program.getIntermediate(kLang[s]), o.spirv[s], &opt);
+        if (!scanSpirv(o.spirv[s], infos[s])) {
+            o.log += "glvk: unreadable SPIR-V\n";
             ok = false;
         }
     }
     BindingPlan plan;
-    plan.attribs = &p->attribLocations;
-    int defaultSize = 0;
+    plan.attribs = &in.attribs;
     if (ok) {
         int nextSampler = 0;
         std::string arrayName;
@@ -403,7 +428,7 @@ bool linkProgram(Program* p) {
                 u.arraySize = int(std::max(1u, smp.count));
                 if (smp.array) {
                     if (!arrayName.empty() || smp.count > kSamplerArrayMax) {
-                        p->log += "glvk: more than one sampler array, or one of more than 8\n";
+                        o.log += "glvk: more than one sampler array, or one of more than 8\n";
                         ok = false;
                         break;
                     }
@@ -411,7 +436,7 @@ bool linkProgram(Program* p) {
                     u.binding = B_SAMPLER_ARRAY;
                 } else {
                     if (nextSampler >= B_SAMPLER_COUNT) {
-                        p->log += "glvk: too many samplers\n";
+                        o.log += "glvk: too many samplers\n";
                         ok = false;
                         break;
                     }
@@ -419,31 +444,31 @@ bool linkProgram(Program* p) {
                 }
                 u.units.assign(size_t(u.arraySize), 0);
                 plan.samplers[u.name] = u.binding;
-                p->samplerMask |= 1u << u.binding;
-                p->uniforms.push_back(u);
+                o.samplerMask |= 1u << u.binding;
+                o.uniforms.push_back(u);
             }
             for (const SpvInfo::Block& blk : infos[s].blocks) {
                 if (blk.type == "gl_DefaultUniformBlock" ||
                     std::find(plan.blocks.begin(), plan.blocks.end(), blk.type) != plan.blocks.end())
                     continue;
                 if (int(plan.blocks.size()) >= B_UBO_COUNT) {
-                    p->log += "glvk: too many uniform blocks\n";
+                    o.log += "glvk: too many uniform blocks\n";
                     ok = false;
                     break;
                 }
                 plan.blocks.push_back(blk.type);
             }
         }
-        p->blockNames = plan.blocks;
-        p->blockSizes.assign(plan.blocks.size(), 0);
+        o.blockNames = plan.blocks;
+        o.blockSizes.assign(plan.blocks.size(), 0);
         for (int b = 0; b < program.getNumUniformBlocks(); b++) {
             const glslang::TObjectReflection& blk = program.getUniformBlock(b);
-            if (blk.name == "gl_DefaultUniformBlock") defaultSize = blk.size;
+            if (blk.name == "gl_DefaultUniformBlock") o.defaultSize = blk.size;
             for (size_t i = 0; i < plan.blocks.size(); i++)
-                if (plan.blocks[i] == blk.name) p->blockSizes[i] = blk.size;
+                if (plan.blocks[i] == blk.name) o.blockSizes[i] = blk.size;
         }
-        for (size_t i = 0; i < p->blockSizes.size(); i++)
-            if (p->blockSizes[i] <= 0) p->blockSizes[i] = 65536;  // not live in any stage: never read
+        for (size_t i = 0; i < o.blockSizes.size(); i++)
+            if (o.blockSizes[i] <= 0) o.blockSizes[i] = 65536;  // not live in any stage: never read
         for (int i = 0; ok && i < program.getNumUniformVariables(); i++) {
             const glslang::TObjectReflection& r = program.getUniform(i);
             if (isSamplerType(r.glDefineType)) continue;  // from the SPIR-V above
@@ -457,32 +482,215 @@ bool linkProgram(Program* p) {
             u.arraySize = std::max(1, r.size);
             u.arrayStride = r.arrayStride;
             if (u.arraySize > 1 && u.arrayStride <= 0) u.arrayStride = 16;
-            p->uniforms.push_back(u);
+            o.uniforms.push_back(u);
         }
-        for (const SpvInfo::Input& in : infos[0].inputs) {
-            auto it = p->attribLocations.find(in.name);
-            if (it == p->attribLocations.end()) continue;  // reported by patchSpirv
-            p->inputMask |= 1u << it->second;
-            if (in.integer) p->inputInteger |= 1u << it->second;
+        for (const SpvInfo::Input& inp : infos[0].inputs) {
+            auto it = in.attribs.find(inp.name);
+            if (it == in.attribs.end()) continue;  // reported by patchSpirv
+            o.inputMask |= 1u << it->second;
+            if (inp.integer) o.inputInteger |= 1u << it->second;
         }
     }
     for (int s = 0; ok && s < 3; s++)
-        if (stages[s] && !patchSpirv(p->spirv[s], infos[s], kLang[s], plan, p->log)) ok = false;
+        if (present[s] && !patchSpirv(o.spirv[s], infos[s], kLang[s], plan, o.log)) ok = false;
     for (glslang::TShader* sh : shaders) delete sh;
-    if (ok) ok = makeModules(p);
-    if (!ok) {
-        for (auto& s : p->spirv) s.clear();
-        return false;
+    for (int s = 0; ok && s < 3; s++) {
+        if (o.spirv[s].empty()) continue;
+        o.modules[s] = makeModule(o.spirv[s]);
+        if (!o.modules[s]) ok = false;
     }
-    p->defaultBlock.assign(size_t(std::max(defaultSize, 16)), 0);
-    p->defaultDirty = true;
-    p->linked = true;
-    return true;
+    if (!ok) {
+        for (int s = 0; s < 3; s++) {
+            if (o.modules[s]) vkDestroyShaderModule(D.dev, o.modules[s], nullptr);
+            o.modules[s] = VK_NULL_HANDLE;
+            o.spirv[s].clear();
+        }
+    }
+    o.ok = ok;
+
+}
+
+// ------------------------------------------------------------------ compile threads
+std::mutex s_queueMu;
+std::condition_variable s_queueCv;
+std::deque<std::shared_ptr<LinkJob>> s_queue;
+std::vector<std::thread> s_workers;
+bool s_quit = false;
+int s_threads = -1;  // compile threads; -1: not chosen yet, 0: compile at glLinkProgram
+
+void makeLibraries(LinkJob& j) {
+    if (j.out.ok && D.gpl) {
+        // both depth clamp settings, and the EFB's sample count
+        static const int msaa = [] {
+            const char* e = getenv("SMS_MSAA");
+            const int n = e ? atoi(e) : 0;
+            return n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 0;
+        }();
+        j.libPre[1] = makePreRasterLibrary(j.out.modules, true);
+        j.libFrag[msaa == 8 ? 3 : msaa == 4 ? 2 : msaa == 2 ? 1 : 0] =
+            makeFragmentLibrary(j.out.modules[2], VkSampleCountFlagBits(msaa ? msaa : 1));
+        j.libPre[0] = makePreRasterLibrary(j.out.modules, false);
+    }
+    {
+        std::lock_guard<std::mutex> lk(j.m);
+        j.libState.store(1);
+    }
+    j.cv.notify_all();
+}
+
+// `libraries`: on a compile thread, which goes on to make the job's pipeline
+// library parts; on the GL thread they are left to the draws.
+void runJob(LinkJob& j, bool libraries) {
+    compileLink(j.in, j.out);
+    if (!libraries) j.libState.store(1);
+    {
+        std::lock_guard<std::mutex> lk(j.m);
+        j.state.store(2);
+    }
+    j.cv.notify_all();
+    if (libraries) makeLibraries(j);
+}
+
+void worker() {
+#ifdef __linux__
+    // below the game's threads: compiles ahead of need must not slow a frame
+    setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 5);
+#endif
+    for (;;) {
+        std::shared_ptr<LinkJob> j;
+        {
+            std::unique_lock<std::mutex> lk(s_queueMu);
+            s_queueCv.wait(lk, [] { return s_quit || !s_queue.empty(); });
+            if (s_quit) return;
+            j = s_queue.front();
+            s_queue.pop_front();
+        }
+        int waiting = 0;
+        if (j->state.compare_exchange_strong(waiting, 1)) runJob(*j, true);
+    }
+}
+
+void startWorkers(int n) {
+    while (int(s_workers.size()) < n) s_workers.emplace_back(worker);
+}
+
+int defaultThreads() {
+    if (const char* e = getenv("SMS_VK_COMPILE_THREADS")) return std::max(0, std::min(16, atoi(e)));
+    const unsigned hw = std::thread::hardware_concurrency();
+    return int(std::max(1u, std::min(4u, hw > 1 ? hw - 1 : 1u)));
+}
+
+void apply(Program* p, LinkOutput& o) {
+    p->linked = o.ok;
+    p->log = std::move(o.log);
+    for (int s = 0; s < 3; s++) {
+        p->spirv[s] = std::move(o.spirv[s]);
+        p->modules[s] = o.modules[s];
+    }
+    p->uniforms = std::move(o.uniforms);
+    p->blockNames = std::move(o.blockNames);
+    p->blockSizes = std::move(o.blockSizes);
+    p->inputMask = o.inputMask;
+    p->inputInteger = o.inputInteger;
+    p->samplerMask = o.samplerMask;
+    p->hasGeometry = o.hasGeometry;
+    if (o.ok) {
+        p->defaultBlock.assign(size_t(std::max(o.defaultSize, 16)), 0);
+        p->defaultDirty = true;
+    }
+}
+
+}  // namespace
+
+void setCompileThreads(GLuint n) {
+    s_threads = n == 0xFFFFFFFFu ? defaultThreads() : int(std::min<GLuint>(n, 16));
+    startWorkers(s_threads);
+}
+
+bool linkProgram(Program* p) {
+    if (!s_glslangReady) {
+        glslang::InitializeProcess();
+        s_glslangReady = true;
+    }
+    finishLink(p);
+    destroyProgramObjects(p);
+    p->linked = false;
+    p->log.clear();
+    p->uniforms.clear();
+    p->blockNames.clear();
+    p->blockSizes.clear();
+    p->defaultBlock.clear();
+    p->inputMask = p->inputInteger = p->samplerMask = 0;
+    p->hasGeometry = false;
+    for (auto& s : p->spirv) s.clear();
+    if (!p->id) p->id = s_nextProgramId++;
+    auto job = std::make_shared<LinkJob>();
+    for (GLuint n : p->shaders) {
+        const Shader* sh = g_shaders.get(n);
+        if (!sh) continue;
+        const int s = sh->type == GL_VERTEX_SHADER ? 0 : sh->type == GL_GEOMETRY_SHADER ? 1 : sh->type == GL_FRAGMENT_SHADER ? 2 : -1;
+        if (s >= 0) job->in.src[s] = sh->source;
+    }
+    job->in.attribs = p->attribLocations;
+    if (s_threads < 0) setCompileThreads(0xFFFFFFFFu);
+    if (s_threads > 0) {
+        p->job = job;
+        {
+            std::lock_guard<std::mutex> lk(s_queueMu);
+            s_queue.push_back(job);
+        }
+        s_queueCv.notify_one();
+        return true;
+    }
+    runJob(*job, false);
+    apply(p, job->out);
+    return p->linked;
+}
+
+bool linkDone(const Program* p) { return !p->job || p->job->state.load() == 2; }
+
+void takeLibraries(Program* p, LinkJob& j) {
+    for (int i = 0; i < 2; i++)
+        if (j.libPre[i] && !p->libPre[i]) p->libPre[i] = j.libPre[i], j.libPre[i] = VK_NULL_HANDLE;
+    for (int i = 0; i < 4; i++)
+        if (j.libFrag[i] && !p->libFrag[i]) p->libFrag[i] = j.libFrag[i], j.libFrag[i] = VK_NULL_HANDLE;
+    for (VkPipeline& l : j.libPre)
+        if (l) vkDestroyPipeline(D.dev, l, nullptr), l = VK_NULL_HANDLE;
+    for (VkPipeline& l : j.libFrag)
+        if (l) vkDestroyPipeline(D.dev, l, nullptr), l = VK_NULL_HANDLE;
+}
+
+// The parts a compile thread made for p, waiting for them if it is on them.
+void programLibraries(Program* p) {
+    if (!p->libJob) return;
+    std::shared_ptr<LinkJob> j = std::move(p->libJob);
+    {
+        std::unique_lock<std::mutex> lk(j->m);
+        j->cv.wait(lk, [&] { return j->libState.load() == 1; });
+    }
+    takeLibraries(p, *j);
+}
+
+void finishLink(Program* p) {
+    if (!p->job) return;
+    std::shared_ptr<LinkJob> j = std::move(p->job);
+    int waiting = 0;
+    if (j->state.compare_exchange_strong(waiting, 1)) {
+        runJob(*j, false);  // not started yet: compile it here rather than wait for a thread
+    } else {
+        std::unique_lock<std::mutex> lk(j->m);
+        j->cv.wait(lk, [&] { return j->state.load() == 2; });
+    }
+    apply(p, j->out);
+    if (j->libState.load() == 0) p->libJob = j;  // its library parts are still being made
+    else takeLibraries(p, *j);
+    if (!p->linked) logmsg("glvk: program link failed: %s", p->log.c_str());
 }
 
 void programUniform(Program* p, GLint loc, int comps, GLsizei count, const void* data, bool integer) {
     (void)integer;
     if (!p || loc < 0) return;
+    finishLink(p);
     const size_t idx = size_t(loc) >> 8;
     int elem = loc & 0xFF;
     if (idx >= p->uniforms.size()) return;
@@ -540,6 +748,7 @@ struct Reader {
 }  // namespace
 
 bool programBinary(Program* p, std::vector<uint8_t>& out) {
+    finishLink(p);
     if (!p->linked) return false;
     out.assign(kBinaryMagic, kBinaryMagic + 8);
     putU32(out, kBinaryVersion);
@@ -573,6 +782,7 @@ bool programBinary(Program* p, std::vector<uint8_t>& out) {
 }
 
 bool loadProgramBinary(Program* p, const void* data, size_t len) {
+    finishLink(p);
     destroyProgramObjects(p);
     p->linked = false;
     Reader r{static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + len};
@@ -657,6 +867,16 @@ std::vector<uint32_t> compileGlsl(int stage, const char* src) {
 }
 
 void shaderShutdown() {
+    {
+        std::lock_guard<std::mutex> lk(s_queueMu);
+        s_quit = true;
+        s_queue.clear();
+    }
+    s_queueCv.notify_all();
+    for (std::thread& t : s_workers) t.join();
+    s_workers.clear();
+    s_quit = false;
+    s_threads = -1;
     if (s_glslangReady) glslang::FinalizeProcess();
     s_glslangReady = false;
 }

@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
-# tools/make_mac_app.sh APP EXE SDL2_FRAMEWORK
+# tools/make_mac_app.sh APP EXE SDL2_FRAMEWORK [MOLTENVK_DYLIB]
 #
 # Fills in the app bundle APP (e.g. build/macos-64/SMS.app) around the files
 # already in APP/Contents/Resources: disc.gcm (tools/bundle_disc.py
 # --image-only) and SMS.icns (tools/extract_icon.py).
 #   Contents/MacOS/sms                  EXE (finds SDL2 via @executable_path/../Frameworks)
 #   Contents/Frameworks/SDL2.framework  SDL2_FRAMEWORK
+#   Contents/Frameworks/libMoltenVK.dylib  MOLTENVK_DYLIB, when given (the Vulkan
+#                                          backend, renderer = vulkan)
 #   Contents/Info.plist
 # then signs the bundle ad hoc. platform/disc reads the image from
 # Contents/Resources, so the app needs no disc image and no SDL2 install.
 set -euo pipefail
 
-if (( $# != 3 )); then
-  echo "usage: $0 APP EXE SDL2_FRAMEWORK" >&2
+if (( $# != 3 && $# != 4 )); then
+  echo "usage: $0 APP EXE SDL2_FRAMEWORK [MOLTENVK_DYLIB]" >&2
   exit 2
 fi
 app=$1
 exe=$2
 fw=$3
+mvk=${4:-}
 
 if [[ ! -f "$app/Contents/Resources/disc.gcm" ]]; then
   echo "$app/Contents/Resources/disc.gcm is missing (tools/bundle_disc.py --image-only writes it)" >&2
@@ -37,6 +40,11 @@ cp "$exe" "$app/Contents/MacOS/sms"
 rm -rf "$app/Contents/Frameworks/SDL2.framework"
 # ditto keeps the framework's symlinks and its signature intact.
 ditto "$fw" "$app/Contents/Frameworks/SDL2.framework"
+rm -f "$app/Contents/Frameworks/libMoltenVK.dylib"
+if [[ -n "$mvk" ]]; then
+  # glvk finds it at @executable_path/../Frameworks (platform/gx/src/vk)
+  cp "$mvk" "$app/Contents/Frameworks/libMoltenVK.dylib"
+fi
 
 cat > "$app/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

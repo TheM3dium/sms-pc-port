@@ -112,6 +112,7 @@ Options can be kept in [`settings.txt`](settings.txt) (`resolution = 2`, `textur
 | `SMS_VSYNC=1` | wait for the display's refresh; `adaptive` shows a late frame at once instead of waiting a whole refresh |
 | `SMS_MSAA=n` | multisample anti-aliasing with 2, 4 or 8 samples (up to what the GPU supports) |
 | `SMS_GX_GL_THREAD=0` | keep OpenGL on the game's own thread instead of a thread of its own (for troubleshooting a graphics driver) |
+| `SMS_GX_BACKEND=vulkan` | draw with Vulkan instead of OpenGL (`renderer = vulkan` in `settings.txt`; see [docs/VULKAN.md](docs/VULKAN.md)); without a working Vulkan driver the game uses OpenGL |
 | `SMS_FXAA=1` | FXAA on the final picture, smoothing edges MSAA leaves (alpha-tested foliage, fences) |
 | `SMS_SHARPEN=n` | contrast-adaptive sharpening of the final picture, 0 to 100 |
 | `SMS_GAMMA=x` | brightness curve: 1.0 is unchanged, above 1 is brighter (0.3 to 3) |
@@ -259,6 +260,7 @@ docs/                 developer documentation and reference screenshots
 - [BUILD.md](BUILD.md): prerequisites for each system, the standalone build and macOS app, manual CMake builds, troubleshooting.
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): where a fix goes (decomp, patch or platform), how the build works, the platform layer, the decomp patches, every environment variable, developer tools, performance.
 - [docs/64-BIT.md](docs/64-BIT.md): how the 64-bit build works and what is left.
+- [docs/VULKAN.md](docs/VULKAN.md): the optional Vulkan backend, how it is compared with OpenGL and benchmarked, and the MoltenVK groundwork.
 - `platform/*/README.md`: each platform module in detail.
 - [ext/README.md](ext/README.md): extensions, and how to write one; [ext/multiplayer/README.md](ext/multiplayer/README.md): multiplayer.
 

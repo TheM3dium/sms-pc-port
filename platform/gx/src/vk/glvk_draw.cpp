@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 
 namespace glvk {
 
@@ -125,6 +126,8 @@ struct CmdCache {
 };
 CmdCache s_cc;
 uint32_t s_constVersion = 1;  // bumped by glVertexAttrib*
+uint32_t s_framePipelines = 0;      // made since the last present
+double s_framePipelineSeconds = 0;
 uint32_t s_pipelineCreates = 0;
 
 // ------------------------------------------------------------------ vertex layouts
@@ -403,18 +406,8 @@ VkPipeline createPipeline(Program* p, const VertexLayout* vl, const PipeKey& k) 
     cb.logicOp = VkLogicOp(k.logicOp);
     cb.attachmentCount = k.colorFormat ? 1 : 0;
     cb.pAttachments = &att;
-    VkDynamicState dyn[12];
     uint32_t nd = 0;
-    dyn[nd++] = VK_DYNAMIC_STATE_VIEWPORT;
-    dyn[nd++] = VK_DYNAMIC_STATE_SCISSOR;
-    dyn[nd++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
-    if (D.eds) {
-        dyn[nd++] = VK_DYNAMIC_STATE_CULL_MODE;
-        dyn[nd++] = VK_DYNAMIC_STATE_FRONT_FACE;
-        dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE;
-        dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
-        dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP;
-    }
+    const VkDynamicState* dyn = pipelineDynamicStates(&nd);
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = nd;
     dy.pDynamicStates = dyn;
@@ -437,7 +430,11 @@ VkPipeline createPipeline(Program* p, const VertexLayout* vl, const PipeKey& k) 
     ci.pDynamicState = &dy;
     ci.layout = D.pipeLayout;
     VkPipeline pipe = VK_NULL_HANDLE;
+    const double t0 = now();
     VkResult r = vkCreateGraphicsPipelines(D.dev, D.pipelineCache, 1, &ci, nullptr, &pipe);
+    g_stats.pipelineSeconds += now() - t0;
+    s_framePipelines++;
+    s_framePipelineSeconds += now() - t0;
     if (r != VK_SUCCESS) {
         static int told = 0;
         if (told++ < 8) logmsg("Vulkan: vkCreateGraphicsPipelines failed (%d) for program %u", int(r), p->id);
@@ -448,12 +445,123 @@ VkPipeline createPipeline(Program* p, const VertexLayout* vl, const PipeKey& k) 
     return pipe;
 }
 
+// ------------------------------------------------------------------ pipeline libraries
+// With VK_EXT_graphics_pipeline_library, a pipeline is linked (fast, no
+// compile) from four parts: the vertex input (per vertex layout and
+// topology), the program's pre-rasterisation and fragment shaders (made once
+// per program, on a compile thread right after it links), and the fragment
+// output (per target formats and blend state).
+std::unordered_map<uint64_t, VkPipeline> s_vertexLibs, s_outputLibs;
+
+VkPipeline createLibrary(VkGraphicsPipelineCreateInfo& ci, VkGraphicsPipelineLibraryFlagsEXT part, void* more) {
+    VkGraphicsPipelineLibraryCreateInfoEXT li{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
+    li.flags = part;
+    li.pNext = more;
+    ci.pNext = &li;
+    ci.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+    uint32_t nd = 0;
+    const VkDynamicState* dyn = pipelineDynamicStates(&nd);
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = nd;
+    dy.pDynamicStates = dyn;
+    ci.pDynamicState = &dy;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(D.dev, D.pipelineCache, 1, &ci, nullptr, &pipe) != VK_SUCCESS) {
+        static std::atomic<int> told{0};
+        if (told++ < 4) logmsg("Vulkan: a pipeline library (part %#x) failed", unsigned(part));
+        return VK_NULL_HANDLE;
+    }
+    return pipe;
+}
+
+VkPipeline vertexInputLibrary(const VertexLayout* vl, VkPrimitiveTopology topo) {
+    const uint64_t key = vl->hash * 31 + uint64_t(topo);
+    auto it = s_vertexLibs.find(key);
+    if (it != s_vertexLibs.end()) return it->second;
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = vl->nbind;
+    vi.pVertexBindingDescriptions = vl->binds;
+    vi.vertexAttributeDescriptionCount = vl->nattr;
+    vi.pVertexAttributeDescriptions = vl->attrs;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = topo;
+    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    return s_vertexLibs[key] = createLibrary(ci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, nullptr);
+}
+
+VkPipeline outputLibrary(const PipeKey& k) {
+    struct OutKey {
+        uint32_t color, depth;
+        uint8_t samples, blend, srcRGB, dstRGB, srcA, dstA, opRGB, opA, writeMask, logic, logicOp, pad;
+    } ok{k.colorFormat, k.depthFormat, k.samples, k.blend, k.srcRGB, k.dstRGB, k.srcA, k.dstA, k.opRGB, k.opA, k.writeMask,
+         k.logic, k.logicOp, 0};
+    const uint64_t key = fnv(&ok, sizeof ok);
+    auto it = s_outputLibs.find(key);
+    if (it != s_outputLibs.end()) return it->second;
+    VkPipelineColorBlendAttachmentState att{};
+    att.blendEnable = k.blend;
+    att.srcColorBlendFactor = VkBlendFactor(k.srcRGB);
+    att.dstColorBlendFactor = VkBlendFactor(k.dstRGB);
+    att.colorBlendOp = VkBlendOp(k.opRGB);
+    att.srcAlphaBlendFactor = VkBlendFactor(k.srcA);
+    att.dstAlphaBlendFactor = VkBlendFactor(k.dstA);
+    att.alphaBlendOp = VkBlendOp(k.opA);
+    att.colorWriteMask = k.writeMask;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.logicOpEnable = k.logic;
+    cb.logicOp = VkLogicOp(k.logicOp);
+    cb.attachmentCount = k.colorFormat ? 1 : 0;
+    cb.pAttachments = &att;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VkSampleCountFlagBits(k.samples ? k.samples : 1);
+    VkFormat color = VkFormat(k.colorFormat);
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = k.colorFormat ? 1 : 0;
+    ri.pColorAttachmentFormats = &color;
+    ri.depthAttachmentFormat = VkFormat(k.depthFormat);
+    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.pColorBlendState = &cb;
+    ci.pMultisampleState = &ms;
+    return s_outputLibs[key] = createLibrary(ci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, &ri);
+}
+
+int sampleIndex(uint32_t samples) { return samples >= 8 ? 3 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0; }
+
+VkPipeline linkPipeline(Program* p, const VertexLayout* vl, const PipeKey& k) {
+    const int clamp = k.depthClamp ? 1 : 0, si = sampleIndex(k.samples);
+    programLibraries(p);
+    if (!p->libPre[clamp]) p->libPre[clamp] = makePreRasterLibrary(p->modules, clamp != 0);
+    if (!p->libFrag[si]) p->libFrag[si] = makeFragmentLibrary(p->modules[2], VkSampleCountFlagBits(k.samples ? k.samples : 1));
+    VkPipeline libs[4] = {vertexInputLibrary(vl, VkPrimitiveTopology(k.topology)), p->libPre[clamp], p->libFrag[si],
+                          outputLibrary(k)};
+    for (VkPipeline l : libs)
+        if (!l) return createPipeline(p, vl, k);  // a part failed: the whole pipeline at once
+    VkPipelineLibraryCreateInfoKHR li{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
+    li.libraryCount = 4;
+    li.pLibraries = libs;
+    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.pNext = &li;
+    ci.layout = D.pipeLayout;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    const double t0 = now();
+    VkResult r = vkCreateGraphicsPipelines(D.dev, D.pipelineCache, 1, &ci, nullptr, &pipe);
+    g_stats.pipelineSeconds += now() - t0;
+    s_framePipelines++;
+    s_framePipelineSeconds += now() - t0;
+    if (r != VK_SUCCESS) return createPipeline(p, vl, k);
+    s_pipelineCreates++;
+    g_stats.pipelines++;
+    return pipe;
+}
+
 VkPipeline pipelineFor(Program* p, const VertexLayout* vl, VkPrimitiveTopology topo) {
     const PipeKey k = pipeKey(vl, topo);
     const uint64_t h = fnv(&k, sizeof k);
     auto it = p->pipelines.find(h);
     if (it != p->pipelines.end()) return it->second;
-    VkPipeline pipe = createPipeline(p, vl, k);
+    VkPipeline pipe = D.gpl ? linkPipeline(p, vl, k) : createPipeline(p, vl, k);
     p->pipelines[h] = pipe;
     return pipe;
 }
@@ -634,7 +742,9 @@ bool bindVertexInput(VkCommandBuffer cb, const VertexLayout* vl) {
 // Everything a draw needs, up to the draw command. False: nothing to draw.
 bool prepareDraw(GLenum mode, VkCommandBuffer* outCb) {
     Program* p = g_programs.get(S.program);
-    if (!p || !p->linked) return false;
+    if (!p) return false;
+    finishLink(p);
+    if (!p->linked) return false;
     DescSet ds;
     gatherDescriptors(p, ds);
     if (!ensureRendering()) return false;
@@ -825,6 +935,66 @@ void clear(GLbitfield mask) {
 }  // namespace
 
 // ------------------------------------------------------------------ shared with the other files
+const VkDynamicState* pipelineDynamicStates(uint32_t* count) {
+    static const VkDynamicState kDyn[] = {VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+                                          VK_DYNAMIC_STATE_BLEND_CONSTANTS,   VK_DYNAMIC_STATE_CULL_MODE,
+                                          VK_DYNAMIC_STATE_FRONT_FACE,        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                          VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP};
+    *count = D.eds ? 8 : 3;
+    return kDyn;
+}
+
+// A program's pre-rasterisation shaders (vertex, geometry) as a library;
+// thread-safe (compile threads make them right after a program links).
+VkPipeline makePreRasterLibrary(const VkShaderModule modules[3], bool depthClamp) {
+    VkPipelineShaderStageCreateInfo stages[2];
+    uint32_t ns = 0;
+    const VkShaderStageFlagBits kStage[2] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
+    for (int s = 0; s < 2; s++) {
+        if (!modules[s]) continue;
+        stages[ns] = VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[ns].stage = kStage[s];
+        stages[ns].module = modules[s];
+        stages[ns].pName = "main";
+        ns++;
+    }
+    VkPipelineViewportDepthClipControlCreateInfoEXT clip{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
+    clip.negativeOneToOne = VK_TRUE;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.pNext = D.depthClipControl ? &clip : nullptr;
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.depthClampEnable = depthClamp && D.features.depthClamp;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.lineWidth = 1.0f;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = ns;
+    ci.pStages = stages;
+    ci.pViewportState = &vp;
+    ci.pRasterizationState = &rs;
+    ci.layout = D.pipeLayout;
+    return createLibrary(ci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &ri);
+}
+
+VkPipeline makeFragmentLibrary(VkShaderModule fs, VkSampleCountFlagBits samples) {
+    VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    st.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    st.module = fs;
+    st.pName = "main";
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = samples;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = 1;
+    ci.pStages = &st;
+    ci.pDepthStencilState = &ds;
+    ci.pMultisampleState = &ms;
+    ci.layout = D.pipeLayout;
+    return createLibrary(ci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &ri);
+}
+
 void endRendering() {
     if (!s_rendering) return;
     endQueryPiece();
@@ -845,6 +1015,11 @@ void beforeSubmit() {
 }
 
 void destroyDrawObjects() {
+    for (auto* m : {&s_vertexLibs, &s_outputLibs}) {
+        for (auto& kv : *m)
+            if (kv.second) vkDestroyPipeline(D.dev, kv.second, nullptr);
+        m->clear();
+    }
     for (auto& kv : s_clearPipes) vkDestroyPipeline(D.dev, kv.second, nullptr);
     s_clearPipes.clear();
     if (s_clearVs) vkDestroyShaderModule(D.dev, s_clearVs, nullptr);
@@ -858,13 +1033,28 @@ void destroyDrawObjects() {
 
 uint32_t pipelineCreates() { return s_pipelineCreates; }
 
+// SMS_GX_HITCH_MS=n: a frame whose pipelines took over n/4 ms says so (the
+// renderer's own hitch line has the frame's total).
+void pipelineFrameEnd(uint32_t frame) {
+    static double limit = -1;
+    if (limit < 0) {
+        const char* e = getenv("SMS_GX_HITCH_MS");
+        limit = e ? atof(e) / 4000.0 : 0;
+    }
+    if (limit > 0 && s_framePipelineSeconds > limit)
+        logmsg("Vulkan: present %u made %u pipelines in %.1f ms", frame, s_framePipelines, s_framePipelineSeconds * 1000.0);
+    s_framePipelines = 0;
+    s_framePipelineSeconds = 0;
+}
+
 // ------------------------------------------------------------------ GL entry points
 namespace {
 
 const GLenum kBinaryFormat = 0x474C564B;  // 'GLVK'
 
 std::vector<std::string> extensions() {
-    std::vector<std::string> e = {"GL_ARB_shader_image_load_store", "GL_ARB_buffer_storage", "GL_ARB_sampler_objects"};
+    std::vector<std::string> e = {"GL_ARB_shader_image_load_store", "GL_ARB_buffer_storage", "GL_ARB_sampler_objects",
+                                  "GL_KHR_parallel_shader_compile"};
     if (D.features.textureCompressionBC) {
         e.push_back("GL_EXT_texture_compression_s3tc");
         e.push_back("GL_ARB_texture_compression_bptc");
@@ -1224,10 +1414,14 @@ GLAPI_FN(void, x_glGetProgramiv)(GLuint p, GLenum pname, GLint* v) {
     Program* pr = g_programs.get(p);
     *v = 0;
     if (!pr) return;
+    if (pname == 0x91B1) {  // GL_COMPLETION_STATUS_KHR: without waiting
+        *v = linkDone(pr) ? GL_TRUE : GL_FALSE;
+        return;
+    }
+    finishLink(pr);
     switch (pname) {
     case GL_LINK_STATUS: *v = pr->linked ? GL_TRUE : GL_FALSE; break;
     case GL_INFO_LOG_LENGTH: *v = GLint(pr->log.size() + 1); break;
-    case 0x91B1: *v = GL_TRUE; break;  // GL_COMPLETION_STATUS_KHR
     case GL_PROGRAM_BINARY_LENGTH: {
         std::vector<uint8_t> bin;
         *v = programBinary(pr, bin) ? GLint(bin.size()) : 0;
@@ -1238,6 +1432,7 @@ GLAPI_FN(void, x_glGetProgramiv)(GLuint p, GLenum pname, GLint* v) {
 }
 GLAPI_FN(void, x_glGetProgramInfoLog)(GLuint p, GLsizei size, GLsizei* len, GLchar* log) {
     Program* pr = g_programs.get(p);
+    if (pr) finishLink(pr);
     const std::string s = pr ? pr->log : std::string();
     const GLsizei n = size > 0 ? GLsizei(std::min(s.size(), size_t(size - 1))) : 0;
     if (log && size > 0) {
@@ -1250,6 +1445,7 @@ GLAPI_FN(void, x_glUseProgram)(GLuint p) { S.program = p; }
 GLAPI_FN(void, x_glDeleteProgram)(GLuint p) {
     Program* pr = g_programs.get(p);
     if (!pr) return;
+    finishLink(pr);
     destroyProgramObjects(pr);
     if (S.program == p) S.program = 0;
     g_programs.remove(p);
@@ -1261,6 +1457,7 @@ GLAPI_FN(void, x_glBindFragDataLocation)(GLuint, GLuint, const GLchar*) {}  // o
 GLAPI_FN(GLint, x_glGetUniformLocation)(GLuint p, const GLchar* name) {
     Program* pr = g_programs.get(p);
     if (!pr || !name) return -1;
+    finishLink(pr);
     std::string n = name;
     int elem = 0;
     size_t b = n.find('[');
@@ -1275,12 +1472,14 @@ GLAPI_FN(GLint, x_glGetUniformLocation)(GLuint p, const GLchar* name) {
 GLAPI_FN(GLuint, x_glGetUniformBlockIndex)(GLuint p, const GLchar* name) {
     Program* pr = g_programs.get(p);
     if (!pr) return GL_INVALID_INDEX;
+    finishLink(pr);
     for (size_t i = 0; i < pr->blockNames.size(); i++)
         if (pr->blockNames[i] == name) return GLuint(i);
     return GL_INVALID_INDEX;
 }
 GLAPI_FN(void, x_glUniformBlockBinding)(GLuint p, GLuint idx, GLuint binding) {
     Program* pr = g_programs.get(p);
+    if (pr) finishLink(pr);
     if (pr && idx < GLuint(B_UBO_COUNT)) pr->blockBindings[idx] = binding;
 }
 Program* current() { return g_programs.get(S.program); }
@@ -1311,6 +1510,7 @@ GLAPI_FN(void, x_glProgramBinary)(GLuint p, GLenum format, const void* data, GLs
     if (format != kBinaryFormat || !loadProgramBinary(pr, data, size_t(len))) pr->linked = false;
 }
 GLAPI_FN(void, x_glProgramParameteri)(GLuint, GLenum, GLint) {}
+GLAPI_FN(void, x_glMaxShaderCompilerThreadsKHR)(GLuint n) { setCompileThreads(n); }
 
 // textures
 GLAPI_FN(void, x_glGenTextures)(GLsizei n, GLuint* out) {
@@ -1452,7 +1652,8 @@ const ProcEntry kProcs[] = {
     P(glLinkProgram), P(glGetProgramiv), P(glGetProgramInfoLog), P(glUseProgram), P(glDeleteProgram), P(glBindAttribLocation),
     P(glBindFragDataLocation), P(glGetUniformLocation), P(glGetUniformBlockIndex), P(glUniformBlockBinding), P(glUniform1i),
     P(glUniform1iv), P(glUniform2iv), P(glUniform4iv), P(glUniform1f), P(glUniform2f), P(glUniform1fv), P(glUniform2fv),
-    P(glUniform4fv), P(glGetProgramBinary), P(glProgramBinary), P(glProgramParameteri), P(glGenTextures), P(glDeleteTextures),
+    P(glUniform4fv), P(glGetProgramBinary), P(glProgramBinary), P(glProgramParameteri), P(glMaxShaderCompilerThreadsKHR),
+    P(glGenTextures), P(glDeleteTextures),
     P(glBindTexture), P(glActiveTexture), P(glTexImage2D), P(glTexSubImage2D), P(glCompressedTexImage2D),
     P(glCompressedTexSubImage2D), P(glTexParameteri), P(glTexParameterf), P(glGenerateMipmap), P(glGenSamplers),
     P(glDeleteSamplers), P(glBindSampler), P(glSamplerParameteri), P(glSamplerParameterf), P(glGenFramebuffers),

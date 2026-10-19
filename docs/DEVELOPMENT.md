@@ -280,6 +280,7 @@ The everyday options are in the [README](../README.md#options); this is the full
 | `SMS_MARIO_LOOK` | a folder of Mario's repainted textures (the launcher's Customize Mario), read before every texture pack and even with `SMS_TEXTURE_PACKS=0` (see [mods/README.md](../mods/README.md)) |
 | `SMS_GX_SHADER_WARMUP`, `SMS_GX_SHADER_KEYS`, `SMS_GX_HITCH_MS` | the shader warm-up (`0` off), recording the program keys stages draw with, and logging slow frames with their causes (see [platform/gx/README.md](../platform/gx/README.md)) |
 | `SMS_GX_*` | graphics switches (`platform/gx/README.md`) |
+| `SMS_GX_BACKEND=vulkan`, `SMS_VK_*` | the Vulkan backend and its switches (device, validation, frames in flight, MoltenVK library, portability test): [VULKAN.md](VULKAN.md) |
 
 ## Progress log
 

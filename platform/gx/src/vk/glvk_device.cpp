@@ -117,6 +117,20 @@ bool hasExtension(const std::vector<VkExtensionProperties>& list, const char* na
     return false;
 }
 
+}  // namespace
+
+VmaAllocationCreateInfo hostBufferAllocInfo(bool readback) {
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | (readback ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                                                             : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+    if (readback) aci.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    else aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return aci;
+}
+
+namespace {
+
 bool fileExists(const std::string& p) {
 #ifdef _WIN32
     FILE* f = fopen(p.c_str(), "rb");
@@ -430,8 +444,9 @@ static void statsFrame() {
     if (every <= 0 || ++g_stats.frames < uint32_t(every)) return;
     const double f = g_stats.frames;
     logmsg("Vulkan stats: %.1f submits/frame (%.2f ms), %.2f ms/frame waiting for the GPU, %.0f draws/frame, "
-           "%.1f render passes/frame, %u pipelines made", g_stats.submits / f, g_stats.submitSeconds * 1000.0 / f,
-           g_stats.waitSeconds * 1000.0 / f, g_stats.draws / f, g_stats.renderPasses / f, g_stats.pipelines);
+           "%.1f render passes/frame, %u pipelines made (%.2f ms/frame)", g_stats.submits / f,
+           g_stats.submitSeconds * 1000.0 / f, g_stats.waitSeconds * 1000.0 / f, g_stats.draws / f,
+           g_stats.renderPasses / f, g_stats.pipelines, g_stats.pipelineSeconds * 1000.0 / f);
     {
         VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
         vmaGetHeapBudgets(D.vma, budgets);
@@ -868,6 +883,13 @@ bool init(const InitInfo& info) {
     }
     const bool edsExt = !core13 && add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
     const bool clipCtl = add(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+    const char* gplEnv = getenv("SMS_VK_PIPELINE_LIBRARY");
+    const bool gplExt = !(gplEnv && !strcmp(gplEnv, "0")) && hasExtension(dexts, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                        hasExtension(dexts, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    if (gplExt) {
+        add(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        add(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
     D.portability = add("VK_KHR_portability_subset");
 
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -880,6 +902,7 @@ bool init(const InitInfo& info) {
     VkPhysicalDeviceDepthClipControlFeaturesEXT fcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     PortabilityFeatures fps{};
     fps.sType = kPortabilityFeaturesType;
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     void** tail = &f2.pNext;
     auto chain = [&](void* s, void** next) {
         *tail = s;
@@ -895,7 +918,16 @@ bool init(const InitInfo& info) {
     if (edsExt) chain(&feds, &feds.pNext);
     if (clipCtl) chain(&fcc, &fcc.pNext);
     if (D.portability) chain(&fps, &fps.pNext);
+    if (gplExt) chain(&fgpl, &fgpl.pNext);
     vkGetPhysicalDeviceFeatures2(D.phys, &f2);
+    if (gplExt) {
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT pgpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pp.pNext = &pgpl;
+        vkGetPhysicalDeviceProperties2(D.phys, &pp);
+        D.gpl = fgpl.graphicsPipelineLibrary && pgpl.graphicsPipelineLibraryFastLinking;
+        fgpl.graphicsPipelineLibrary = D.gpl;
+    }
     if (D.portability) {
         // enable only what glvk uses; samplers without LOD bias leave it to the shaders
         const VkBool32 lodBias = fps.samplerMipLodBias, alpha = fps.constantAlphaColorBlendFactors;
@@ -1001,6 +1033,7 @@ bool init(const InitInfo& info) {
         D.eds = D.cmdSetCullMode && D.cmdSetFrontFace && D.cmdSetDepthTestEnable && D.cmdSetDepthWriteEnable &&
                 D.cmdSetDepthCompareOp && D.cmdSetPrimitiveTopology;
     }
+    D.gpl = D.gpl && D.eds;  // the libraries leave cull, front face and depth to dynamic state
     if (!D.cmdBeginRendering || !D.cmdPushDescriptorSet || !D.waitSemaphores) {
         logmsg("Vulkan: %s is missing entry points it reported", D.name);
         shutdown();
@@ -1017,13 +1050,27 @@ bool init(const InitInfo& info) {
     vci.device = D.dev;
     vci.instance = D.instance;
     vci.pVulkanFunctions = &vf;
-    // 32 MiB blocks (VMA's default is 256): the host-visible ones are system
-    // memory the process keeps while any allocation in them lives
-    vci.preferredLargeHeapBlockSize = VkDeviceSize(32) << 20;
     if (vmaCreateAllocator(&vci, &D.vma) != VK_SUCCESS) {
         logmsg("Vulkan: the memory allocator failed to start");
         shutdown();
         return false;
+    }
+
+    // GL buffers live in system memory, in pools of 16 MiB blocks (VMA's own
+    // are 256 MiB, which the process would keep while any buffer lived in
+    // one); large ones get memory of their own
+    for (int readback = 0; readback < 2; readback++) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = 65536;
+        bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo aci = hostBufferAllocInfo(readback != 0);
+        uint32_t type = 0;
+        if (vmaFindMemoryTypeIndexForBufferInfo(D.vma, &bci, &aci, &type) != VK_SUCCESS) continue;
+        VmaPoolCreateInfo pci{};
+        pci.memoryTypeIndex = type;
+        pci.blockSize = VkDeviceSize(16) << 20;
+        vmaCreatePool(D.vma, &pci, &D.hostPools[readback]);
     }
 
     VkSemaphoreTypeCreateInfo stci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -1108,7 +1155,7 @@ bool init(const InitInfo& info) {
     vkGetPhysicalDeviceProperties2(D.phys, &p2);
     logmsg("Vulkan %u.%u.%u on %s (%s %s)%s%s%s, depth %s%s", VK_VERSION_MAJOR(D.apiVersion), VK_VERSION_MINOR(D.apiVersion),
            VK_VERSION_PATCH(D.props.apiVersion), D.name, core12 ? drv.driverName : "driver", core12 ? drv.driverInfo : "",
-           D.eds ? ", extended dynamic state" : "", D.depthClipControl ? ", depth clip control" : "",
+           D.gpl ? ", pipeline libraries" : D.eds ? ", extended dynamic state" : "", D.depthClipControl ? ", depth clip control" : "",
            D.portability ? ", portability subset" : "", D.depthIsD24 ? "24-bit" : "32-bit float",
            validation ? ", validation on" : "");
     if (!D.features.geometryShader) logmsg("Vulkan: no geometry shaders: wide lines are drawn 1 pixel wide");
@@ -1154,6 +1201,8 @@ void shutdown() {
         if (D.setLayout) vkDestroyDescriptorSetLayout(D.dev, D.setLayout, nullptr);
         if (D.pipelineCache) vkDestroyPipelineCache(D.dev, D.pipelineCache, nullptr);
         if (D.timeline) vkDestroySemaphore(D.dev, D.timeline, nullptr);
+        for (VmaPool& pool : D.hostPools)
+            if (pool) vmaDestroyPool(D.vma, pool), pool = VK_NULL_HANDLE;
         if (D.vma) vmaDestroyAllocator(D.vma);
         vkDestroyDevice(D.dev, nullptr);
     }
@@ -1209,6 +1258,7 @@ bool presentFrame() {
     s_presents++;
     statsFrame();
     realizePending();
+    pipelineFrameEnd(s_presents);
     if ((s_presents & 1023) == 0) savePipelineCache(false);
     if (!s_sc.surface) {  // headless: submit, keeping as many frames in flight as with a window
         submit();

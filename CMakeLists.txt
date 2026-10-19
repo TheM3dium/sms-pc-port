@@ -510,9 +510,11 @@ if(SMS_BUNDLE_DISC AND APPLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/bundle_disc.py "${SMS_BUNDLE_DISC}"
     COMMENT "Extracting the SMS.app icon"
     VERBATIM)
+  # -DSMS_MOLTENVK_DYLIB (build.sh fetches it): the Vulkan backend's library
+  set(SMS_MOLTENVK_DYLIB "" CACHE FILEPATH "libMoltenVK.dylib to put in SMS.app (the Vulkan backend)")
   add_custom_command(OUTPUT ${_app}/Contents/MacOS/sms
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_mac_app.sh
-            ${_app} $<TARGET_FILE:sms> ${SMS_SDL2_FRAMEWORK_DIR}/SDL2.framework
+            ${_app} $<TARGET_FILE:sms> ${SMS_SDL2_FRAMEWORK_DIR}/SDL2.framework ${SMS_MOLTENVK_DYLIB}
     DEPENDS sms ${_app_disc} ${_app_icon} ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_mac_app.sh
             ${SMS_SDL2_FRAMEWORK_DIR}/SDL2.framework/SDL2
     COMMENT "Assembling SMS.app"

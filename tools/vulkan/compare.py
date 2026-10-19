@@ -12,7 +12,8 @@ difference, and an image (--out) of OpenGL | Vulkan | the difference x16.
 Exits 1 when any field differs (or with --tolerance, differs by more).
 
 Runs are one at a time under a memory cap (systemd-run --user, when there),
-and their captures are deleted unless --keep is given.
+and their captures are deleted unless --keep is given. --window runs both in
+a window (macOS, which has no headless OpenGL).
 """
 import argparse
 import os
@@ -55,6 +56,9 @@ def run_once(exe, disc, spec, backend, work, timeout, mem):
     env['SMS_SHOTS'] = ','.join(str(n) for n in spec['shots'])
     if backend == 'vulkan':
         env['SMS_GX_BACKEND'] = 'vulkan'
+    if WINDOW:  # macOS has no headless OpenGL: both in a window
+        env['SMS_HEADLESS'] = '0'
+        env.setdefault('SMS_WINDOW_SIZE', '1280x960')
     env.update(EXTRA_ENV)
     last = max(spec['shots'])
     marker = '[vi] captured field %d ' % last
@@ -125,6 +129,7 @@ def compare(a_dir, b_dir, fields, out, name, tolerance):
 
 
 EXTRA_ENV = {}
+WINDOW = False
 
 
 def main():
@@ -138,7 +143,10 @@ def main():
     ap.add_argument('--tolerance', type=int, default=0, help='largest channel difference allowed')
     ap.add_argument('--mem', default='2500M', help='memory cap per run (systemd-run), "" for none')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for both runs')
+    ap.add_argument('--window', action='store_true', help='run in a window instead of headless (macOS)')
     args = ap.parse_args()
+    global WINDOW
+    WINDOW = args.window
     for kv in args.env:
         k, _, v = kv.partition('=')
         EXTRA_ENV[k] = v

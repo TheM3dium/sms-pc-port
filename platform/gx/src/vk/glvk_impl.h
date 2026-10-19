@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -69,6 +70,7 @@ struct Device {
     bool depthClipControl = false; // GL's [-1, 1] clip depth without a shader fix-up
     bool portability = false;      // MoltenVK (VK_KHR_portability_subset)
     bool noLodBias = false;        // samplers cannot bias the LOD (Metal): the shaders do (texture's bias argument)
+    bool gpl = false;              // graphics pipeline libraries with fast linking: shaders built once per program
     bool hostQueryReset = true;
     PFN_vkCmdBeginRendering cmdBeginRendering = nullptr;
     PFN_vkCmdEndRendering cmdEndRendering = nullptr;
@@ -88,6 +90,8 @@ struct Device {
     bool depthBlit = false;       // vkCmdBlitImage works on depthFormat
     float maxAnisotropy = 1.0f;
 
+    VmaPool hostPools[2] = {};  // GL buffers: written by the CPU, read by it (pixel pack buffers)
+
     VkSemaphore timeline = VK_NULL_HANDLE;
     uint64_t submitted = 0;  // the last serial submitted
     uint64_t completed = 0;  // the last serial known to have finished
@@ -100,6 +104,7 @@ struct Device {
     VkShaderStageFlags pushStages = 0;  // of push constant bytes 0-15 (the point size)
 };
 extern Device D;
+VmaAllocationCreateInfo hostBufferAllocInfo(bool readback);
 
 // The serial the commands being recorded now will signal.
 inline uint64_t currentSerial() { return D.submitted + 1; }
@@ -119,6 +124,7 @@ void drawRecorded();
 struct Stats {
     uint32_t submits = 0, draws = 0, pipelines = 0, renderPasses = 0, frames = 0;
     double waitSeconds = 0, submitSeconds = 0;
+    double pipelineSeconds = 0;  // making pipelines
 };
 extern Stats g_stats;
 double now();
@@ -285,6 +291,7 @@ struct UniformInfo {
 };
 
 struct VertexLayout;
+struct LinkJob;
 struct Program {
     std::vector<GLuint> shaders;
     std::unordered_map<std::string, int> attribLocations;  // glBindAttribLocation
@@ -305,7 +312,12 @@ struct Program {
     uint32_t samplerMask = 0; // bindings of samplers it uses (bit per binding)
     bool hasGeometry = false;
     std::unordered_map<uint64_t, VkPipeline> pipelines;
+    // with graphics pipeline libraries: the shader parts, which pipelines link
+    VkPipeline libPre[2] = {};   // pre-rasterisation shaders, without and with depth clamp
+    VkPipeline libFrag[4] = {};  // fragment shader, by sample count (1, 2, 4, 8)
     uint32_t id = 0;
+    std::shared_ptr<LinkJob> job;     // a link still compiling on a worker thread
+    std::shared_ptr<LinkJob> libJob;  // a link whose pipeline library parts are still being made
 };
 
 struct Query {
@@ -404,6 +416,12 @@ void destroyBuffer(Buffer* b);
 
 // ------------------------------------------------------------------ shaders (glvk_shader.cpp)
 bool linkProgram(Program* p);
+// GL_KHR_parallel_shader_compile: glLinkProgram hands the compile to a worker
+// thread; anything that needs the program waits for it (finishLink).
+void finishLink(Program* p);
+void programLibraries(Program* p);  // takes (or waits for) a compile thread's library parts
+bool linkDone(const Program* p);
+void setCompileThreads(GLuint n);
 void programUniform(Program* p, GLint loc, int comps, GLsizei count, const void* data, bool integer);
 bool programBinary(Program* p, std::vector<uint8_t>& out);
 bool loadProgramBinary(Program* p, const void* data, size_t len);
@@ -449,7 +467,12 @@ void deleteSync(GLsync s);
 
 // ------------------------------------------------------------------ draws (glvk_draw.cpp)
 void destroyDrawObjects();
+// Graphics pipeline libraries (D.gpl): a program's shader parts.
+VkPipeline makePreRasterLibrary(const VkShaderModule modules[3], bool depthClamp);
+VkPipeline makeFragmentLibrary(VkShaderModule fs, VkSampleCountFlagBits samples);
+const VkDynamicState* pipelineDynamicStates(uint32_t* count);
 uint32_t pipelineCreates();
+void pipelineFrameEnd(uint32_t frame);
 // Every GL object's Vulkan objects (at shutdown).
 void destroyAllObjects();
 
