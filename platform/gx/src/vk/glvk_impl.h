@@ -71,6 +71,7 @@ struct Device {
     bool portability = false;      // MoltenVK (VK_KHR_portability_subset)
     bool noLodBias = false;        // samplers cannot bias the LOD (Metal): the shaders do (texture's bias argument)
     bool gpl = false;              // graphics pipeline libraries with fast linking: shaders built once per program
+    bool displayTiming = false;    // VK_GOOGLE_display_timing: which presents the compositor has shown (MoltenVK)
     bool hostQueryReset = true;
     PFN_vkCmdBeginRendering cmdBeginRendering = nullptr;
     PFN_vkCmdEndRendering cmdEndRendering = nullptr;
@@ -123,6 +124,7 @@ void drawRecorded();
 // SMS_GX_STATS: what glvk spent, logged with the renderer's stats.
 struct Stats {
     uint32_t submits = 0, draws = 0, pipelines = 0, renderPasses = 0, frames = 0;
+    uint32_t dropped = 0;  // frames not presented: no drawable free without waiting (vsync off, MoltenVK)
     double waitSeconds = 0, submitSeconds = 0;
     double pipelineSeconds = 0;  // making pipelines
 };

@@ -68,6 +68,11 @@ struct Swapchain {
     uint64_t frameSerial[kFramesMax] = {};
     uint32_t frame = 0, frames = 2;
     int vsync = 0;
+    bool immediate = false;  // present mode immediate (vsync off)
+    uint32_t unshown = 0;    // presents the compositor has not shown yet (displayTiming)
+    uint32_t unshownMax = 0; // presents left unshown before frames are dropped
+    uint32_t clean = 0;      // presents since one waited for a drawable
+    double lastPresent = 0;
     bool dirty = false;
     bool blitDst = true;
     void* window = nullptr;
@@ -379,9 +384,13 @@ bool createSwapchain() {
     }
     s_sc.handle = sc;
     s_sc.extent = extent;
+    s_sc.immediate = ci.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+    s_sc.unshown = 0;
+    s_sc.clean = 0;
     uint32_t n = 0;
     vkGetSwapchainImagesKHR(D.dev, sc, &n, nullptr);
     s_sc.images.resize(n);
+    s_sc.unshownMax = n + 2;
     vkGetSwapchainImagesKHR(D.dev, sc, &n, s_sc.images.data());
     VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     s_sc.renderDone.resize(n);
@@ -445,6 +454,7 @@ static void statsFrame() {
            "%.1f render passes/frame, %u pipelines made (%.2f ms/frame)", g_stats.submits / f,
            g_stats.submitSeconds * 1000.0 / f, g_stats.waitSeconds * 1000.0 / f, g_stats.draws / f,
            g_stats.renderPasses / f, g_stats.pipelines, g_stats.pipelineSeconds * 1000.0 / f);
+    if (g_stats.dropped) logmsg("Vulkan stats: %u of %u frames not presented (no drawable free)", g_stats.dropped, g_stats.frames);
     {
         VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
         vmaGetHeapBudgets(D.vma, budgets);
@@ -889,6 +899,9 @@ bool init(const InitInfo& info) {
         add(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
     }
     D.portability = add("VK_KHR_portability_subset");
+    // Core Animation's drawables are given back only as the compositor shows
+    // frames; presentFrame drops a frame rather than wait for one (vsync off)
+    if (D.portability && info.sdlWindow) D.displayTiming = add(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
 
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -1252,6 +1265,27 @@ void setSwapInterval(int vsync) {
     if (s_sc.handle) s_sc.dirty = true;
 }
 
+// With vsync off on MoltenVK, Metal still hands out a swapchain's drawables
+// (one per image) only as the compositor lets them go, and the blit into the
+// next one waits for it in nextDrawable: the game would run at the
+// compositor's pace. So a frame is not presented (as a GL driver's compositor
+// drops frames it has no time for) while too many presents are not reported
+// shown yet. Drawables come back a little before their frames are reported
+// (on an M4 at 120 Hz, waits start past 5 unshown with 3 images), so the limit
+// starts at the images + 2, drops by one (to 2 at least) whenever a present
+// still waited and comes back after 120 that did not. A frame is presented at
+// least every 50 ms, in case the compositor stops reporting (a hidden window).
+bool droppingFrame() {
+    VkPastPresentationTimingGOOGLE shown[16];
+    for (;;) {
+        uint32_t n = 16;
+        if (vkGetPastPresentationTimingGOOGLE(D.dev, s_sc.handle, &n, shown) < 0) return false;
+        s_sc.unshown -= std::min(s_sc.unshown, n);
+        if (n < 16) break;
+    }
+    return s_sc.unshown >= s_sc.unshownMax && now() - s_sc.lastPresent < 0.05;
+}
+
 bool presentFrame() {
     s_presents++;
     statsFrame();
@@ -1271,6 +1305,14 @@ bool presentFrame() {
         return false;
     }
     const uint32_t f = s_sc.frame;
+    if (s_sc.immediate && D.displayTiming && droppingFrame()) {
+        g_stats.dropped++;
+        submit();
+        s_sc.frameSerial[f] = D.submitted;
+        s_sc.frame = (f + 1) % s_sc.frames;
+        waitSerial(s_sc.frameSerial[s_sc.frame]);
+        return true;
+    }
     uint32_t idx = 0;
     VkResult r = vkAcquireNextImageKHR(D.dev, s_sc.handle, UINT64_MAX, s_sc.acquire[f], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -1324,7 +1366,17 @@ bool presentFrame() {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
                          1, &b);
     VkSemaphore done = s_sc.renderDone[idx];
+    const double t0 = now();
     submitSegment(s_sc.acquire[f], VK_PIPELINE_STAGE_TRANSFER_BIT, done);
+    if (s_sc.immediate && D.displayTiming) {
+        if (now() - t0 > 0.002 && s_sc.unshown >= 2) {  // waited for a drawable (taken as the blit is encoded)
+            s_sc.unshownMax = std::max(2u, s_sc.unshownMax - 1);
+            s_sc.clean = 0;
+        } else if (++s_sc.clean >= 120 && s_sc.unshownMax < s_sc.images.size() + 2) {
+            s_sc.unshownMax++;
+            s_sc.clean = 0;
+        }
+    }
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &done;
@@ -1332,6 +1384,8 @@ bool presentFrame() {
     pi.pSwapchains = &s_sc.handle;
     pi.pImageIndices = &idx;
     r = vkQueuePresentKHR(D.queue, &pi);
+    s_sc.unshown++;
+    s_sc.lastPresent = now();
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) s_sc.dirty = true;
     else if (r != VK_SUCCESS) logmsg("Vulkan: vkQueuePresentKHR failed (%d)", int(r));
     s_sc.frameSerial[f] = D.submitted;

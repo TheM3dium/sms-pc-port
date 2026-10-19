@@ -79,7 +79,11 @@ Smoothness: shaders compile on threads of their own (`GL_KHR_parallel_shader_com
 
 ## macOS (MoltenVK)
 
-The groundwork is in; it still has to be built and tried on a Mac.
+Tried on an Apple M4 (macOS 15.7, MoltenVK 1.4.2, x86_64 game under Rosetta), against OpenGL 4.1 (Apple's, on Metal):
+
+- Pictures (`compare.py title plaza tour --window`): the title is identical; every plaza and tour field is within 0.4% of its pixels of OpenGL's, most within 0.02%. The most, about 0.3% in the plaza's fields from 4600, lie on horizontal bands of the floor where its mip levels meet (trilinear filtering's blend, by up to 26 levels; the same with the shaders adding the LOD bias), the rest are single pixels.
+- Frame rate (`bench.py`, 1280x960): 2.18 ms (459 fps) against OpenGL's 2.33 ms (428 fps) at 1x, 7% faster; 2.48 ms (403 fps) against 3.22 ms (311 fps) at 3x, 30% faster.
+- With vsync off, Metal hands out a swapchain's drawables only as the compositor lets them go, and MoltenVK waits for one (`nextDrawable`) as it encodes the blit into it, which held the game to the compositor's pace (6.2 ms a frame, whatever was drawn). glvk asks MoltenVK which presents were shown (`VK_GOOGLE_display_timing`) and does not present a frame while too many are not (the Vulkan stats count those frames), as Apple's OpenGL drops frames the compositor has no time for; about 155 frames a second still reach the 120 Hz screen. With vsync on nothing changes.
 
 - `./build.sh` on macOS fetches MoltenVK 1.4.2 (a universal `libMoltenVK.dylib`, checked against its SHA-256) into `build/deps/`, copies it beside `sms`, and puts it in `SMS.app/Contents/Frameworks`. `SMS_GX_VULKAN=OFF ./build.sh` leaves the backend out.
 - glvk loads that dylib directly (no Vulkan loader needed): `libMoltenVK.dylib` or `libvulkan.1.dylib` beside the executable or in `../Frameworks`, else `SMS_VK_LIBRARY`, else the loader. SDL is pointed at the same library before it makes the window.
