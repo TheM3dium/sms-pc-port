@@ -109,6 +109,8 @@ struct CmdCache {
     VkRect2D sc{};
     float bc[4] = {};
     float pc[4] = {};
+    bool biasValid = false;
+    float bias[8] = {};
     int cull = -1, front = -1, dtest = -1, dwrite = -1, dcmp = -1;
     VkBuffer vb[kMaxAttribs + 1] = {};
     VkDeviceSize vbOff[kMaxAttribs + 1] = {};
@@ -499,8 +501,7 @@ bool applyDynamicState(VkCommandBuffer cb) {
     }
     const float pc[4] = {S.pointSize, 0.0f, 0.0f, 0.0f};
     if (!s_cc.pcValid || memcmp(pc, s_cc.pc, sizeof pc) != 0) {
-        vkCmdPushConstants(cb, D.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT | (D.features.geometryShader ? VK_SHADER_STAGE_GEOMETRY_BIT : 0),
-                           0, sizeof pc, pc);
+        vkCmdPushConstants(cb, D.pipeLayout, D.pushStages, 0, sizeof pc, pc);
         memcpy(s_cc.pc, pc, sizeof pc);
         s_cc.pcValid = true;
     }
@@ -510,6 +511,7 @@ bool applyDynamicState(VkCommandBuffer cb) {
 // The program's descriptors: textures are resolved (and put in the layout
 // for sampling) before rendering begins, since that can need a barrier.
 struct DescSet {
+    float bias[8];  // the sampler array's LOD biases (without sampler LOD bias)
     VkDescriptorBufferInfo ubo[B_SAMPLER_ARRAY];
     VkDescriptorImageInfo imgs[kSamplerArrayMax + B_SAMPLER_COUNT];  // the array's elements, then the scalars
     uint32_t mask;  // bindings used
@@ -517,6 +519,7 @@ struct DescSet {
 };
 
 void gatherDescriptors(Program* p, DescSet& ds) {
+    memset(ds.bias, 0, sizeof ds.bias);
     ds.mask = 1u << B_DEFAULT_UBO;
     ds.arrayCount = 0;
     if (p->defaultDirty || p->defaultBoundSerial != currentSerial()) {
@@ -547,6 +550,11 @@ void gatherDescriptors(Program* p, DescSet& ds) {
             const GLuint smp = unit >= 0 && unit < kMaxUnits ? S.samplers[unit] : 0;
             const int slot = u.binding == B_SAMPLER_ARRAY ? e : kSamplerArrayMax + (u.binding - B_SAMPLERS);
             ds.imgs[slot] = textureDescriptor(tex, smp);
+            if (D.noLodBias && u.binding == B_SAMPLER_ARRAY && e < 8) {
+                const SamplerObj* so = g_samplers.get(smp);
+                const Texture* t = g_textures.get(tex);
+                ds.bias[e] = so ? so->lodBias : t ? t->lodBias : 0.0f;
+            }
         }
         if (u.binding == B_SAMPLER_ARRAY) ds.arrayCount = uint32_t(u.arraySize);
         ds.mask |= 1u << u.binding;
@@ -640,6 +648,11 @@ bool prepareDraw(GLenum mode, VkCommandBuffer* outCb) {
         s_cc.pipeline = pipe;
     }
     pushDescriptors(cb, ds);
+    if (D.noLodBias && (!s_cc.biasValid || memcmp(ds.bias, s_cc.bias, sizeof ds.bias) != 0)) {
+        vkCmdPushConstants(cb, D.pipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 16, sizeof ds.bias, ds.bias);
+        memcpy(s_cc.bias, ds.bias, sizeof ds.bias);
+        s_cc.biasValid = true;
+    }
     if (!bindVertexInput(cb, vl)) return false;
     *outCb = cb;
     return true;
@@ -917,7 +930,16 @@ GLAPI_FN(void, x_glGetIntegerv)(GLenum pname, GLint* v) {
     case GL_NUM_EXTENSIONS: *v = GLint(extensions().size()); break;
     case GL_MAJOR_VERSION: *v = 3; break;
     case GL_MINOR_VERSION: *v = 3; break;
-    case GL_MAX_SAMPLES: *v = 1; break;  // multisampled EFBs: not yet
+    case GL_MAX_SAMPLES: {
+        const VkSampleCountFlags c = D.props.limits.framebufferColorSampleCounts & D.props.limits.framebufferDepthSampleCounts;
+        *v = 1;
+        for (int n = 64; n > 1; n >>= 1)
+            if (c & VkSampleCountFlags(n)) {
+                *v = n;
+                break;
+            }
+        break;
+    }
     case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: *v = GLint(std::max<VkDeviceSize>(D.props.limits.minUniformBufferOffsetAlignment, 16)); break;
     case GL_PIXEL_PACK_BUFFER_BINDING: *v = GLint(S.packBuffer); break;
     case GL_PIXEL_UNPACK_BUFFER_BINDING: *v = GLint(S.unpackBuffer); break;

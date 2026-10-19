@@ -68,6 +68,7 @@ struct Device {
     bool eds = false;              // extended dynamic state: cull, front face, depth test/write/compare, topology
     bool depthClipControl = false; // GL's [-1, 1] clip depth without a shader fix-up
     bool portability = false;      // MoltenVK (VK_KHR_portability_subset)
+    bool noLodBias = false;        // samplers cannot bias the LOD (Metal): the shaders do (texture's bias argument)
     bool hostQueryReset = true;
     PFN_vkCmdBeginRendering cmdBeginRendering = nullptr;
     PFN_vkCmdEndRendering cmdEndRendering = nullptr;
@@ -96,8 +97,7 @@ struct Device {
     size_t pipelineCacheSavedSize = 0;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
-    VkQueryPool queryPool = VK_NULL_HANDLE;
-    uint32_t queryCount = 0;
+    VkShaderStageFlags pushStages = 0;  // of push constant bytes 0-15 (the point size)
 };
 extern Device D;
 
@@ -312,6 +312,8 @@ struct Query {
     std::vector<uint32_t> slots;  // the Vulkan queries of this GL query, summed
     uint64_t serial = 0;          // the segment that ended it
     bool active = false;
+    bool haveResult = false;      // read (and its slots given back)
+    uint64_t result = 0;
 };
 
 struct Sync {
@@ -439,6 +441,7 @@ void endQuery();
 GLuint queryResult(GLuint id, bool available);
 void deleteQuery(GLuint id);
 void queriesSegmentStart();
+void destroyQueryPools();
 GLsync fenceSync();
 GLenum clientWaitSync(GLsync s, GLbitfield flags, GLuint64 timeout);
 void deleteSync(GLsync s);

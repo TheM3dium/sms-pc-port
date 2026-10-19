@@ -40,6 +40,12 @@ void setSwapInterval(int vsync);
 // "NVIDIA GeForce GTX 1060 6GB" and similar, for logs.
 const char* deviceName();
 
+// The Vulkan library glvk loads when it is not the system's loader: on macOS
+// the libMoltenVK.dylib beside the executable or in the app's Frameworks
+// (SMS_VK_LIBRARY names another). SDL must load the same one
+// (SDL_Vulkan_LoadLibrary) before it makes a Vulkan window. Null: the loader.
+const char* libraryPath();
+
 }  // namespace glvk
 
 #endif

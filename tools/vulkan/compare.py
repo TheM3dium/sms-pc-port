@@ -29,6 +29,16 @@ import regress  # noqa: E402  (its runs, scripted input and base environment)
 
 from PIL import Image, ImageChops  # noqa: E402
 
+# Title and file select, the airstrip's dialogue (A every few seconds), then
+# the plaza tour (plaza-tour.txt): runs, camera sweeps and warps through the
+# plaza's episodes. SMS_WARP=1,0,1 sends the new file to the plaza.
+TOUR_AP = regress.GATE_AP + ',A@3800' + ''.join(',A@%d+4' % f for f in range(4300, 5201, 150))
+TOUR_ENV = {'SMS_WARP': '1,0,1', 'SMS_AUTOPRESS': TOUR_AP,
+            'SMS_DEMO_PILOT': os.path.join(HERE, 'plaza-tour.txt')}
+RUNS = dict(regress.RUNS)
+RUNS['tour'] = dict(game='vanilla', kind='shots', env=TOUR_ENV, shots=list(range(5000, 9801, 400)), timeout=600,
+                    desc='the plaza tour: warps through Delfino Plaza\'s episodes')
+
 
 def read_ppm(path):
     return Image.open(path).convert('RGB')
@@ -139,9 +149,9 @@ def main():
     ok = True
     try:
         for name in args.runs:
-            spec = regress.RUNS.get(name)
+            spec = RUNS.get(name)
             if not spec or not spec.get('shots'):
-                sys.exit('unknown run %r (one of %s)' % (name, ', '.join(k for k, v in regress.RUNS.items() if v.get('shots'))))
+                sys.exit('unknown run %r (one of %s)' % (name, ', '.join(k for k, v in RUNS.items() if v.get('shots'))))
             rw = os.path.join(work, name)
             gl, gl_ok, gl_s = run_once(args.exe, disc, spec, 'opengl', rw, spec['timeout'], args.mem)
             vk, vk_ok, vk_s = run_once(args.exe, disc, spec, 'vulkan', rw, spec['timeout'], args.mem)

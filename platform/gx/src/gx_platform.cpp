@@ -428,6 +428,12 @@ bool openWindow(float scale, bool vulkan) {
             layout.h = h;
         }
     }
+#ifdef SMS_GX_HAVE_VULKAN
+    // SDL opens a Vulkan library for a Vulkan window: the one glvk will use
+    // (the bundled MoltenVK on macOS), or the system's loader
+    if (vulkan && glvk::libraryPath() && SDL_Vulkan_LoadLibrary(glvk::libraryPath()) != 0)
+        logmsg("SDL could not load %s: %s", glvk::libraryPath(), SDL_GetError());
+#endif
     s_window = SDL_CreateWindow("Super Mario Sunshine", layout.x, layout.y, layout.w, layout.h,
                                 (vulkan ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
                                 SDL_WINDOW_HIDDEN);

@@ -1,0 +1,63 @@
+# Delfino Plaza tour for tools/vulkan/bench.py (ext/demo pilot script):
+# looks around and runs at the airstrip arrival, then warps through the
+# plaza's episodes, sweeping the camera in each.
+area 1
+a
+wait 1
+cam 1 0 4
+cam -1 0.4 4
+via 5000 -3000 1
+wait 2
+cam 1 -0.3 3
+stop
+stage 1 1
+wait 5
+a
+wait 1
+a
+cam 1 0 4
+cam -1 0.5 3
+stage 1 2
+wait 5
+a
+wait 1
+a
+cam 1 0 4
+cam -1 -0.3 3
+stage 1 5
+wait 5
+a
+wait 1
+a
+cam 1 0 4
+cam -1 0.3 3
+stage 1 6
+wait 5
+a
+wait 1
+a
+cam 1 0 4
+cam -1 0 3
+stage 1 7
+wait 5
+a
+wait 1
+a
+cam 1 0.4 4
+cam -1 0 3
+stage 1 8
+wait 5
+a
+wait 1
+a
+cam 1 0 4
+cam -1 0.3 3
+stage 1 9
+wait 5
+a
+wait 1
+a
+cam 1 0 4
+cam -1 0 3
+log
+end

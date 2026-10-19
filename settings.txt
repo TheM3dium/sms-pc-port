@@ -56,6 +56,10 @@ frame_rate = 60
 # Monitor to open on (0 is the primary one); by default, the one under the mouse.
 # display = 0
 
+# Graphics API: opengl (default) or vulkan. Without a working Vulkan driver the
+# game starts with OpenGL instead.
+# renderer = opengl
+
 # Anti-aliasing: MSAA smooths the edges of 3D shapes (0, 2, 4 or 8 samples);
 # FXAA also smooths the rest, at almost no cost.
 # msaa = 0

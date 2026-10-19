@@ -785,6 +785,7 @@ static const struct {
 	{ "fullscreen", "SMS_FULLSCREEN" },           // off, on (desktop) or exclusive
 	{ "fullscreen_mode", "SMS_FULLSCREEN_MODE" }, // WxH@Hz, for exclusive
 	{ "display", "SMS_DISPLAY" },                 // monitor, 0 = primary
+	{ "renderer", "SMS_GX_BACKEND" },           // opengl (default) or vulkan
 	{ "msaa", "SMS_MSAA" },                     // 0, 2, 4 or 8
 	{ "fxaa", "SMS_FXAA" },
 	{ "sharpen", "SMS_SHARPEN" },               // 0..100

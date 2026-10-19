@@ -554,7 +554,7 @@ static VkSampler vkSampler(GLint minF, GLint magF, GLint wrapS, GLint wrapT, flo
     k.minLod = std::max(-1000.0f, std::min(1000.0f, minLod));
     k.maxLod = std::max(k.minLod, std::min(1000.0f, maxLod));
     const float maxBias = D.props.limits.maxSamplerLodBias;
-    k.bias = std::max(-maxBias, std::min(maxBias, bias));
+    k.bias = D.noLodBias ? 0.0f : std::max(-maxBias, std::min(maxBias, bias));  // else the shader adds it
     k.aniso = D.features.samplerAnisotropy && aniso > 1.0f ? std::min(aniso, D.maxAnisotropy) : 1.0f;
     auto it = s_vkSamplers.find(k);
     if (it != s_vkSamplers.end()) return it->second;
@@ -820,14 +820,44 @@ void blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLin
         }
         const int32_t sw = int32_t(std::max(1u, src->w >> sl)), sh = int32_t(std::max(1u, src->h >> sl));
         const int32_t dw = int32_t(std::max(1u, dst->w >> dl)), dh = int32_t(std::max(1u, dst->h >> dl));
-        use(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, false);
-        use(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, true);
         VkCommandBuffer cb = mainCmd();
         const bool same = sx1 - sx0 == dx1 - dx0 && sy1 - sy0 == dy1 - dy0 && sx1 > sx0 && sy1 > sy0;
+        if (!(depth && src->samples != VK_SAMPLE_COUNT_1_BIT)) {
+            use(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, false);
+            use(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, true);
+        }
         if (src->samples != VK_SAMPLE_COUNT_1_BIT) {
-            if (depth || !same) {
+            if (!same) {
                 static int told = 0;
-                if (told++ < 2) logmsg("glvk: a multisampled depth or scaled blit is not handled");
+                if (told++ < 2) logmsg("glvk: a scaled multisampled blit is not handled");
+                continue;
+            }
+            if (depth) {
+                // vkCmdResolveImage takes colour only: a render pass over the
+                // rectangle, without draws, whose depth resolves (sample 0)
+                use(src, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT, false);
+                use(dst, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, true);
+                const int32_t x0 = std::max(0, std::max(sx0, dx0)), y0 = std::max(0, std::max(sy0, dy0));
+                const int32_t x1 = std::min(std::min(sx1, sw), dw), y1 = std::min(std::min(sy1, sh), dh);
+                if (sx0 != dx0 || sy0 != dy0 || x1 <= x0 || y1 <= y0) continue;  // the EFB resolves in place
+                VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                da.imageView = imageView(src, sl, 1);
+                da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                da.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+                da.resolveImageView = imageView(dst, dl, 1);
+                da.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                ri.renderArea = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+                ri.layerCount = 1;
+                ri.pDepthAttachment = &da;
+                D.cmdBeginRendering(cb, &ri);
+                D.cmdEndRendering(cb);
                 continue;
             }
             VkImageResolve r{};
@@ -876,7 +906,11 @@ void blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLin
 // ------------------------------------------------------------------ queries
 // A GL query is a run of Vulkan occlusion queries: one per render pass
 // instance it spans (a Vulkan query cannot outlive one), summed at the read.
+// Their slots come from pools of 4096, made as needed, and go back once the
+// result has been read (or the GL query restarts or goes away).
 namespace {
+const uint32_t kPerPool = 4096, kMaxPools = 64;
+std::vector<VkQueryPool> s_pools;
 std::vector<uint32_t> s_freeSlots;
 struct Retired {
     uint64_t serial;
@@ -886,30 +920,48 @@ std::vector<Retired> s_retired;  // slots to reuse once their segment has finish
 uint32_t s_nextSlot = 0;
 int s_openSlot = -1;  // the Vulkan query recording now
 
-void retire(Query* q) {
-    for (uint32_t s : q->slots) s_retired.push_back(Retired{std::max(q->serial, currentSerial()), s});
+VkQueryPool poolOf(uint32_t slot) { return s_pools[slot / kPerPool]; }
+
+void retire(Query* q, uint64_t serial) {
+    for (uint32_t s : q->slots) s_retired.push_back(Retired{serial, s});
     q->slots.clear();
 }
 
+void recycle() {
+    pollCompleted();
+    size_t keep = 0;
+    for (const Retired& r : s_retired) {
+        if (r.serial <= D.completed) {
+            D.resetQueryPool(D.dev, poolOf(r.slot), r.slot % kPerPool, 1);
+            s_freeSlots.push_back(r.slot);
+        } else {
+            s_retired[keep++] = r;
+        }
+    }
+    s_retired.resize(keep);
+}
+
 uint32_t allocSlot() {
+    if (s_freeSlots.empty() && s_nextSlot >= s_pools.size() * kPerPool) recycle();
     if (s_freeSlots.empty()) {
-        if (s_nextSlot < D.queryCount) return s_nextSlot++;
-        pollCompleted();
-        size_t keep = 0;
-        for (const Retired& r : s_retired) {
-            if (r.serial <= D.completed) {
-                D.resetQueryPool(D.dev, D.queryPool, r.slot, 1);
-                s_freeSlots.push_back(r.slot);
-            } else {
-                s_retired[keep++] = r;
-            }
+        if (s_nextSlot >= s_pools.size() * kPerPool && s_pools.size() < kMaxPools) {
+            VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            ci.queryType = VK_QUERY_TYPE_OCCLUSION;
+            ci.queryCount = kPerPool;
+            VkQueryPool pool = VK_NULL_HANDLE;
+            vkCreateQueryPool(D.dev, &ci, nullptr, &pool);
+            D.resetQueryPool(D.dev, pool, 0, kPerPool);
+            s_pools.push_back(pool);
         }
-        s_retired.resize(keep);
-        if (s_freeSlots.empty() && !s_retired.empty()) {  // all in flight: wait for the oldest
+        if (s_nextSlot < s_pools.size() * kPerPool) return s_nextSlot++;
+        while (s_freeSlots.empty() && !s_retired.empty()) {  // all in use: wait for the oldest retired ones
             waitSerial(s_retired.front().serial);
-            return allocSlot();
+            recycle();
         }
-        if (s_freeSlots.empty()) return 0;
+        if (s_freeSlots.empty()) {
+            logmsg("glvk: out of occlusion queries (%u in use)", kPerPool * kMaxPools);
+            abort();
+        }
     }
     uint32_t s = s_freeSlots.back();
     s_freeSlots.pop_back();
@@ -921,22 +973,24 @@ void beginQueryPiece() {
     Query* q = g_queries.get(S.query);
     if (!q || s_openSlot >= 0) return;
     const uint32_t slot = allocSlot();
-    vkCmdBeginQuery(mainCmd(), D.queryPool, slot, D.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    vkCmdBeginQuery(mainCmd(), poolOf(slot), slot % kPerPool,
+                    D.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     q->slots.push_back(slot);
     s_openSlot = int(slot);
 }
 
 void endQueryPiece() {
     if (s_openSlot < 0) return;
-    vkCmdEndQuery(mainCmd(), D.queryPool, uint32_t(s_openSlot));
+    vkCmdEndQuery(mainCmd(), poolOf(uint32_t(s_openSlot)), uint32_t(s_openSlot) % kPerPool);
     s_openSlot = -1;
 }
 
 void beginQuery(GLuint id) {
     Query* q = g_queries.get(id);
     if (!q) return;
-    retire(q);
+    retire(q, std::max(q->serial, currentSerial()));
     q->active = true;
+    q->haveResult = false;
     S.query = id;
     if (renderingActive()) beginQueryPiece();
 }
@@ -954,23 +1008,37 @@ void endQuery() {
 GLuint queryResult(GLuint id, bool available) {
     Query* q = g_queries.get(id);
     if (!q) return 0;
-    if (available) return serialDone(q->serial) ? 1 : 0;
-    waitSerial(q->serial);
-    uint64_t sum = 0;
-    for (uint32_t s : q->slots) {
-        uint64_t v = 0;
-        vkGetQueryPoolResults(D.dev, D.queryPool, s, 1, sizeof v, &v, sizeof v, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        sum += v;
+    if (available) return q->haveResult || serialDone(q->serial) ? 1 : 0;
+    if (!q->haveResult) {
+        waitSerial(q->serial);
+        uint64_t sum = 0;
+        for (uint32_t s : q->slots) {
+            uint64_t v = 0;
+            vkGetQueryPoolResults(D.dev, poolOf(s), s % kPerPool, 1, sizeof v, &v, sizeof v,
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            sum += v;
+        }
+        q->result = sum;
+        q->haveResult = true;
+        retire(q, q->serial);  // read: the slots can go back
     }
-    return sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : GLuint(sum);
+    return q->result > 0xFFFFFFFFull ? 0xFFFFFFFFu : GLuint(q->result);
 }
 
 void deleteQuery(GLuint id) {
     Query* q = g_queries.get(id);
     if (!q) return;
     if (S.query == id) endQuery();
-    retire(q);
+    retire(q, std::max(q->serial, currentSerial()));
     g_queries.remove(id);
+}
+
+void destroyQueryPools() {
+    for (VkQueryPool p : s_pools) vkDestroyQueryPool(D.dev, p, nullptr);
+    s_pools.clear();
+    s_freeSlots.clear();
+    s_retired.clear();
+    s_nextSlot = 0;
 }
 
 void queriesSegmentStart() { s_openSlot = -1; }
@@ -986,6 +1054,7 @@ void destroyAllObjects() {
         if (g_programs.objs[i]) destroyProgramObjects(g_programs.objs[i]);
     destroyBlack();
     destroyReadback();
+    destroyQueryPools();
 }
 
 // ------------------------------------------------------------------ sync objects

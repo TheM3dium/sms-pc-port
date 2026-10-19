@@ -47,10 +47,50 @@ std::string afterVersion(const std::string& src, const std::string& text) {
     return s;
 }
 
-std::string prepare(const std::string& src, EShLanguage stage, bool hasGeometry) {
-    static const char* kPush = "layout(push_constant) uniform GlvkPushConstants { vec4 glvk_pc; };\n";
+// Without sampler LOD bias (Metal), each texture(u_tex[N], coord) call gets
+// the bias as its third argument, from push constants the draw sets.
+std::string biasTextureCalls(const std::string& src) {
+    std::string s = src;
+    const std::string call = "texture(u_tex[";
+    for (size_t at = s.find(call); at != std::string::npos; at = s.find(call, at + 1)) {
+        const size_t idx = at + call.size();
+        const size_t close = s.find(']', idx);
+        if (close == std::string::npos) break;
+        const std::string n = s.substr(idx, close - idx);
+        int depth = 0;
+        size_t end = at + call.size() - 1;  // the call's opening parenthesis
+        for (size_t i = at + 7; i < s.size(); i++) {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')' && --depth == 0) {
+                end = i;
+                break;
+            }
+        }
+        if (depth != 0) break;
+        const std::string arg = ", glvk_bias[(" + n + ") >> 2][(" + n + ") & 3]";
+        s.insert(end, arg);
+    }
+    return s;
+}
+
+std::string prepare(const std::string& src, EShLanguage stage, bool hasGeometry, bool lineFallback) {
+    static const char* kPush = "layout(push_constant) uniform GlvkVertexPC { vec4 glvk_pc; };\n";
     if (stage == EShLangVertex) {
-        std::string s = afterVersion(src, "#define main glvk_user_main\n");
+        std::string body = src;
+        if (lineFallback) {
+            // a line program without its geometry shader: the vertex shader's
+            // outputs keep their names (genLineVS renames v_ to vl_ for it)
+            size_t at = 0;
+            while ((at = body.find("#define v_", at)) != std::string::npos) {
+                size_t eol = body.find('\n', at);
+                if (eol == std::string::npos) eol = body.size();
+                if (body.substr(at, eol - at).find(" vl_") != std::string::npos)
+                    body.erase(at, eol - at + (eol < body.size() ? 1 : 0));
+                else
+                    at = eol;
+            }
+        }
+        std::string s = afterVersion(body, "#define main glvk_user_main\n");
         s += "\n#undef main\n";
         s += kPush;
         s += "void main() {\n  glvk_user_main();\n  gl_PointSize = glvk_pc.x;\n";
@@ -58,6 +98,9 @@ std::string prepare(const std::string& src, EShLanguage stage, bool hasGeometry)
         s += "}\n";
         return s;
     }
+    if (stage == EShLangFragment && D.noLodBias && src.find("texture(u_tex[") != std::string::npos)
+        return afterVersion(biasTextureCalls(src),
+                            "layout(push_constant) uniform GlvkFragmentPC { layout(offset = 16) vec4 glvk_bias[2]; };\n");
     if (stage == EShLangGeometry && depthFixInShader()) {
         return afterVersion(src, std::string(kPush) +
                                      "void glvk_emit() { gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5; EmitVertex(); }\n"
@@ -280,9 +323,15 @@ bool linkProgram(Program* p) {
         p->log = "glvk: a program needs a vertex and a fragment shader";
         return false;
     }
+    bool lineFallback = false;
     if (stages[1] && !D.features.geometryShader) {
-        p->log = "glvk: this device has no geometry shaders";
-        return false;
+        // no geometry shaders (MoltenVK): wide lines are drawn as plain
+        // 1-pixel lines, by the vertex and fragment shaders alone
+        static bool told = false;
+        if (!told) logmsg("glvk: no geometry shaders: wide lines are drawn 1 pixel wide");
+        told = true;
+        stages[1] = nullptr;
+        lineFallback = true;
     }
     p->hasGeometry = stages[1] != nullptr;
     static const EShLanguage kLang[3] = {EShLangVertex, EShLangGeometry, EShLangFragment};
@@ -293,7 +342,7 @@ bool linkProgram(Program* p) {
     bool ok = true;
     for (int s = 0; s < 3 && ok; s++) {
         if (!stages[s]) continue;
-        srcs[s] = prepare(stages[s]->source, kLang[s], p->hasGeometry);
+        srcs[s] = prepare(stages[s]->source, kLang[s], p->hasGeometry, lineFallback);
         shaders[s] = new glslang::TShader(kLang[s]);
         const char* str = srcs[s].c_str();
         shaders[s]->setStrings(&str, 1);
@@ -494,7 +543,8 @@ bool programBinary(Program* p, std::vector<uint8_t>& out) {
     if (!p->linked) return false;
     out.assign(kBinaryMagic, kBinaryMagic + 8);
     putU32(out, kBinaryVersion);
-    putU32(out, (p->hasGeometry ? 1u : 0u) | (depthFixInShader() ? 2u : 0u));
+    putU32(out, (p->hasGeometry ? 1u : 0u) | (depthFixInShader() ? 2u : 0u) | (D.noLodBias ? 4u : 0u) |
+                    (D.features.geometryShader ? 0u : 8u));
     for (int s = 0; s < 3; s++) {
         putU32(out, uint32_t(p->spirv[s].size()));
         const uint8_t* b = reinterpret_cast<const uint8_t*>(p->spirv[s].data());
@@ -530,7 +580,9 @@ bool loadProgramBinary(Program* p, const void* data, size_t len) {
     r.p += 8;
     if (r.u32() != kBinaryVersion) return false;
     const uint32_t flags = r.u32();
-    if (((flags & 2) != 0) != depthFixInShader()) return false;
+    if (((flags & 2) != 0) != depthFixInShader() || ((flags & 4) != 0) != D.noLodBias ||
+        ((flags & 8) != 0) != !D.features.geometryShader)
+        return false;
     p->hasGeometry = (flags & 1) != 0;
     if (p->hasGeometry && !D.features.geometryShader) return false;
     for (int s = 0; s < 3; s++) {

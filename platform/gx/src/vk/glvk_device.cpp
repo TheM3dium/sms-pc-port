@@ -14,6 +14,10 @@
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #endif
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 namespace gx {
 std::string userCacheDir();
@@ -92,10 +96,35 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
     return VK_FALSE;
 }
 
+// VkPhysicalDevicePortabilitySubsetFeaturesKHR (vulkan_beta.h, which volk is
+// not built with): what MoltenVK leaves out.
+struct PortabilityFeatures {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 constantAlphaColorBlendFactors, events, imageViewFormatReinterpretation, imageViewFormatSwizzle,
+        imageView2DOn3DImage, multisampleArrayImage, mutableComparisonSamplers, pointPolygons, samplerMipLodBias,
+        separateStencilMaskRef, shaderSampleRateInterpolationFunctions, tessellationIsolines, tessellationPointMode,
+        triangleFans, vertexAttributeAccessBeyondStride;
+};
+const VkStructureType kPortabilityFeaturesType = VkStructureType(1000163000);
+
+std::string s_libPath;
+bool s_libPathSet = false;
+
 bool hasExtension(const std::vector<VkExtensionProperties>& list, const char* name) {
     for (const VkExtensionProperties& e : list)
         if (!strcmp(e.extensionName, name)) return true;
     return false;
+}
+
+bool fileExists(const std::string& p) {
+#ifdef _WIN32
+    FILE* f = fopen(p.c_str(), "rb");
+    if (f) fclose(f);
+    return f != nullptr;
+#else
+    return access(p.c_str(), R_OK) == 0;
+#endif
 }
 
 void beginSegment() {
@@ -519,7 +548,10 @@ Image* createImage(VkFormat fmt, uint32_t w, uint32_t h, uint32_t levels, VkSamp
     ci.arrayLayers = 1;
     ci.samples = samples;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // multisampled images are only drawn to and resolved (no sampling, which
+    // not every sample count supports)
+    ci.usage = (samples != VK_SAMPLE_COUNT_1_BIT ? 0 : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (attachment && !isCompressedFormat(fmt) && fmt != VK_FORMAT_R32G32B32A32_SFLOAT)
         ci.usage |= depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -686,7 +718,23 @@ static void chooseDepthFormat() {
 
 bool init(const InitInfo& info) {
     if (s_active) return true;
-    if (volkInitialize() != VK_SUCCESS) {
+    VkResult vr = VK_ERROR_INITIALIZATION_FAILED;
+#ifndef _WIN32
+    if (const char* lib = libraryPath()) {
+        // a bundled library (MoltenVK): its entry points stand in for the loader's
+        void* h = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+        auto gipa = h ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(h, "vkGetInstanceProcAddr")) : nullptr;
+        if (gipa) {
+            volkInitializeCustom(gipa);
+            vr = VK_SUCCESS;
+            logmsg("Vulkan: using %s", lib);
+        } else {
+            logmsg("Vulkan: could not load %s (%s)", lib, dlerror());
+        }
+    }
+#endif
+    if (vr != VK_SUCCESS) vr = volkInitialize();
+    if (vr != VK_SUCCESS) {
         logmsg("Vulkan: no Vulkan loader found");
         return false;
     }
@@ -812,6 +860,8 @@ bool init(const InitInfo& info) {
     VkPhysicalDeviceDynamicRenderingFeatures fdr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT feds{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceDepthClipControlFeaturesEXT fcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    PortabilityFeatures fps{};
+    fps.sType = kPortabilityFeaturesType;
     void** tail = &f2.pNext;
     auto chain = [&](void* s, void** next) {
         *tail = s;
@@ -826,7 +876,21 @@ bool init(const InitInfo& info) {
     else chain(&fdr, &fdr.pNext);
     if (edsExt) chain(&feds, &feds.pNext);
     if (clipCtl) chain(&fcc, &fcc.pNext);
+    if (D.portability) chain(&fps, &fps.pNext);
     vkGetPhysicalDeviceFeatures2(D.phys, &f2);
+    if (D.portability) {
+        // enable only what glvk uses; samplers without LOD bias leave it to the shaders
+        const VkBool32 lodBias = fps.samplerMipLodBias, alpha = fps.constantAlphaColorBlendFactors;
+        void* next = fps.pNext;
+        fps = PortabilityFeatures{};
+        fps.sType = kPortabilityFeaturesType;
+        fps.pNext = next;
+        fps.samplerMipLodBias = lodBias;
+        fps.constantAlphaColorBlendFactors = alpha;
+        fps.vertexAttributeAccessBeyondStride = VK_FALSE;
+        D.noLodBias = !lodBias;
+        if (!alpha) logmsg("Vulkan: no constant alpha blend factors: destination alpha writes may differ");
+    }
     const VkPhysicalDeviceFeatures have = f2.features;
     VkPhysicalDeviceFeatures& en0 = f2.features;
     en0 = VkPhysicalDeviceFeatures{};
@@ -838,6 +902,16 @@ bool init(const InitInfo& info) {
     en0.occlusionQueryPrecise = have.occlusionQueryPrecise;
     en0.textureCompressionBC = have.textureCompressionBC;
     en0.shaderClipDistance = have.shaderClipDistance;
+    // SMS_VK_PORTABILITY_TEST=1: behave as on MoltenVK (no geometry shaders,
+    // logic ops or sampler LOD bias, 32-bit float depth) to try those paths
+    // on a desktop GPU
+    const bool emulate = envTrue("SMS_VK_PORTABILITY_TEST");
+    if (emulate) {
+        en0.geometryShader = VK_FALSE;
+        en0.logicOp = VK_FALSE;
+        D.noLodBias = true;
+        logmsg("Vulkan: SMS_VK_PORTABILITY_TEST: no geometry shaders, logic ops or sampler LOD bias, float depth");
+    }
     D.features = en0;
     bool ok = true;
     if (core12) {
@@ -938,6 +1012,13 @@ bool init(const InitInfo& info) {
     vkCreateSemaphore(D.dev, &sci, nullptr, &D.timeline);
 
     chooseDepthFormat();
+    if (emulate) {
+        D.depthFormat = VK_FORMAT_D32_SFLOAT;
+        D.depthIsD24 = false;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(D.phys, D.depthFormat, &fp);
+        D.depthBlit = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
+    }
     loadPipelineCache();
 
     // the descriptor set and pipeline layout every program shares
@@ -961,20 +1042,17 @@ bool init(const InitInfo& info) {
     dsl.bindingCount = B_COUNT;
     dsl.pBindings = binds;
     vkCreateDescriptorSetLayout(D.dev, &dsl, nullptr, &D.setLayout);
-    VkPushConstantRange pcr{stages & ~VkShaderStageFlags(VK_SHADER_STAGE_FRAGMENT_BIT), 0, 16};
+    // bytes 0-15: the point size (vertex and geometry stages); 16-47: the
+    // LOD bias of each of u_tex's eight samplers, without sampler LOD bias
+    D.pushStages = stages & ~VkShaderStageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+    VkPushConstantRange pcr[2] = {{D.pushStages, 0, 16}, {VK_SHADER_STAGE_FRAGMENT_BIT, 16, 32}};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &D.setLayout;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges = &pcr;
+    plci.pushConstantRangeCount = 2;
+    plci.pPushConstantRanges = pcr;
     vkCreatePipelineLayout(D.dev, &plci, nullptr, &D.pipeLayout);
 
-    D.queryCount = 8192;
-    VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    qpci.queryType = VK_QUERY_TYPE_OCCLUSION;
-    qpci.queryCount = D.queryCount;
-    vkCreateQueryPool(D.dev, &qpci, nullptr, &D.queryPool);
-    D.resetQueryPool(D.dev, D.queryPool, 0, D.queryCount);
 
     g_staging.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     g_staging.blockSize = VkDeviceSize(16) << 20;
@@ -1051,7 +1129,6 @@ void shutdown() {
             if (s) vkDestroySemaphore(D.dev, s, nullptr), s = VK_NULL_HANDLE;
         s_sc.renderDone.clear();
         s_sc.handle = VK_NULL_HANDLE;
-        if (D.queryPool) vkDestroyQueryPool(D.dev, D.queryPool, nullptr);
         if (D.pipeLayout) vkDestroyPipelineLayout(D.dev, D.pipeLayout, nullptr);
         if (D.setLayout) vkDestroyDescriptorSetLayout(D.dev, D.setLayout, nullptr);
         if (D.pipelineCache) vkDestroyPipelineCache(D.dev, D.pipelineCache, nullptr);
@@ -1068,6 +1145,29 @@ void shutdown() {
 }
 
 bool active() { return s_active; }
+
+const char* libraryPath() {
+    if (!s_libPathSet) {
+        s_libPathSet = true;
+        if (const char* e = getenv("SMS_VK_LIBRARY")) {
+            if (*e) s_libPath = e;
+        } else {
+#if defined(__APPLE__) && defined(SMS_GX_HAVE_SDL2)
+            if (char* base = SDL_GetBasePath()) {
+                const std::string b = base;
+                SDL_free(base);
+                for (const char* rel : {"libMoltenVK.dylib", "../Frameworks/libMoltenVK.dylib", "libvulkan.1.dylib",
+                                        "../Frameworks/libvulkan.1.dylib"})
+                    if (fileExists(b + rel)) {
+                        s_libPath = b + rel;
+                        break;
+                    }
+            }
+#endif
+        }
+    }
+    return s_libPath.empty() ? nullptr : s_libPath.c_str();
+}
 const char* deviceName() { return D.name; }
 
 void setDefaultFramebufferSize(int w, int h) {
