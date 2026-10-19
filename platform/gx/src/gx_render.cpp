@@ -95,7 +95,9 @@ static bool s_wide2D = false;     // GXPC_SetWide2D: 2D the game laid out past t
 // is narrower than three quarters of the screen (wider ones are the HUD's
 // screen-sized containers), with everything in it (GXPC_HudPaneBegin), or
 // else a draw on its own.
-static bool s_hudEdges = false, s_hud = false;
+// SMS_WIDESCREEN_HUD=edges, or the settings menu's Screen Icons At Edges, is s_hudWanted; it
+// applies only in widescreen, and s_hudEdges is what is in force.
+static bool s_hudWanted = false, s_hudEdges = false, s_hud = false;
 struct HudPane {
     float x1, x2;
 };
@@ -890,13 +892,6 @@ void main() {
 }
 )";
 
-struct PostSettings {
-    bool fxaa = false;
-    int filter = 0;        // 0 bilinear/area, 1 nearest, 2 sharp, 3 fsr, 4 nis
-    float sharpen = 0.0f;  // 0..1
-    float gamma = 1.0f;
-    int aspect = 0;        // 0 keep, 1 stretch, 2 integer
-};
 static PostSettings s_post;
 static GLuint s_fxaaProg, s_scaleProg, s_postTex, s_postFbo;
 static GLint s_fxaaURcp, s_fxaaUFlip, s_scaleUSrc, s_scaleUDst, s_scaleUFilter, s_scaleUSharpen, s_scaleUGamma,
@@ -907,6 +902,58 @@ static GLint s_easuUSrc, s_easuUFlip, s_rcasUDst, s_rcasUCon, s_rcasUGamma, s_rc
 static int s_fsrW, s_fsrH;
 static GLuint s_nisProg, s_nisCoef;
 static GLint s_nisUSrc, s_nisUSharp, s_nisUGamma, s_nisUFlip;
+
+// FSR 1's and NIS's programs, made when the scaler is first set to them (at start by
+// SMS_PRESENT_FILTER, or later from the settings menu), on the GL thread.
+static void postInitFsr() {
+    if (s_easuProg) return;
+    s_easuProg = compileProgram(kPostVs, kEasuFs);
+    glUseProgram(s_easuProg);
+    glUniform1i(glGetUniformLocation(s_easuProg, "u_tex"), 0);
+    s_easuUSrc = glGetUniformLocation(s_easuProg, "u_src");
+    s_easuUFlip = glGetUniformLocation(s_easuProg, "u_flip");
+    s_rcasProg = compileProgram(kPostVs, kRcasFs);
+    glUseProgram(s_rcasProg);
+    glUniform1i(glGetUniformLocation(s_rcasProg, "u_tex"), 0);
+    s_rcasUDst = glGetUniformLocation(s_rcasProg, "u_dst");
+    s_rcasUCon = glGetUniformLocation(s_rcasProg, "u_con");
+    s_rcasUGamma = glGetUniformLocation(s_rcasProg, "u_gamma");
+    s_rcasUFlip = glGetUniformLocation(s_rcasProg, "u_flip");
+}
+
+static void postInitNis() {
+    if (s_nisProg) return;
+    s_nisProg = compileProgram(kPostVs, kNisFs);
+    glUseProgram(s_nisProg);
+    glUniform1i(glGetUniformLocation(s_nisProg, "u_tex"), 0);
+    glUniform1i(glGetUniformLocation(s_nisProg, "u_coef"), 1);
+    s_nisUSrc = glGetUniformLocation(s_nisProg, "u_src");
+    s_nisUSharp = glGetUniformLocation(s_nisProg, "u_sharp");
+    s_nisUGamma = glGetUniformLocation(s_nisProg, "u_gamma");
+    s_nisUFlip = glGetUniformLocation(s_nisProg, "u_flip");
+    // the filter banks as NVScaler reads them: per phase, 8 taps of the scaler then 8 of the USM
+    float coef[64][16] = {};
+    for (int p = 0; p < 64; p++)
+        for (int i = 0; i < 6; i++) {
+            coef[p][i] = kNisCoefScale[p][i];
+            coef[p][8 + i] = kNisCoefUsm[p][i];
+        }
+    glGenTextures(1, &s_nisCoef);
+    glBindTexture(GL_TEXTURE_2D, s_nisCoef);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 4, 64, 0, GL_RGBA, GL_FLOAT, coef);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+}
+
+PostSettings postSettings() { return s_post; }
+
+// Changes the post-processing while the game runs (the GL thread; the settings menu).
+void postApply(const PostSettings& p) {
+    if (p.filter == 3) postInitFsr();
+    if (p.filter == 4) postInitNis();
+    s_post = p;
+    glcInvalidate();  // the programs' set-up left GL state of its own
+}
 
 static void postInit() {
     if (const char* e = getenv("SMS_FXAA")) s_post.fxaa = atoi(e) != 0;
@@ -932,42 +979,8 @@ static void postInit() {
     s_scaleUSharpen = glGetUniformLocation(s_scaleProg, "u_sharpen");
     s_scaleUGamma = glGetUniformLocation(s_scaleProg, "u_gamma");
     s_scaleUFlip = glGetUniformLocation(s_scaleProg, "u_flip");
-    if (s_post.filter == 3) {
-        s_easuProg = compileProgram(kPostVs, kEasuFs);
-        glUseProgram(s_easuProg);
-        glUniform1i(glGetUniformLocation(s_easuProg, "u_tex"), 0);
-        s_easuUSrc = glGetUniformLocation(s_easuProg, "u_src");
-        s_easuUFlip = glGetUniformLocation(s_easuProg, "u_flip");
-        s_rcasProg = compileProgram(kPostVs, kRcasFs);
-        glUseProgram(s_rcasProg);
-        glUniform1i(glGetUniformLocation(s_rcasProg, "u_tex"), 0);
-        s_rcasUDst = glGetUniformLocation(s_rcasProg, "u_dst");
-        s_rcasUCon = glGetUniformLocation(s_rcasProg, "u_con");
-        s_rcasUGamma = glGetUniformLocation(s_rcasProg, "u_gamma");
-        s_rcasUFlip = glGetUniformLocation(s_rcasProg, "u_flip");
-    }
-    if (s_post.filter == 4) {
-        s_nisProg = compileProgram(kPostVs, kNisFs);
-        glUseProgram(s_nisProg);
-        glUniform1i(glGetUniformLocation(s_nisProg, "u_tex"), 0);
-        glUniform1i(glGetUniformLocation(s_nisProg, "u_coef"), 1);
-        s_nisUSrc = glGetUniformLocation(s_nisProg, "u_src");
-        s_nisUSharp = glGetUniformLocation(s_nisProg, "u_sharp");
-        s_nisUGamma = glGetUniformLocation(s_nisProg, "u_gamma");
-        s_nisUFlip = glGetUniformLocation(s_nisProg, "u_flip");
-        // the filter banks as NVScaler reads them: per phase, 8 taps of the scaler then 8 of the USM
-        float coef[64][16] = {};
-        for (int p = 0; p < 64; p++)
-            for (int i = 0; i < 6; i++) {
-                coef[p][i] = kNisCoefScale[p][i];
-                coef[p][8 + i] = kNisCoefUsm[p][i];
-            }
-        glGenTextures(1, &s_nisCoef);
-        glBindTexture(GL_TEXTURE_2D, s_nisCoef);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 4, 64, 0, GL_RGBA, GL_FLOAT, coef);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    }
+    if (s_post.filter == 3) postInitFsr();
+    if (s_post.filter == 4) postInitNis();
     static const char* const kFilters[] = {"bilinear", "nearest", "sharp", "FSR 1", "NIS"};
     static const char* const kAspects[] = {"keep", "stretch", "integer"};
     logmsg("post-processing: FXAA %s, scaler %s, sharpen %d%%, brightness %.2f, aspect %s", s_post.fxaa ? "on" : "off",
@@ -1088,21 +1101,14 @@ static void postPresent(GLuint tex, int w, int h, int ox, int oy, int vw, int vh
     glBindVertexArray(s_vao);
 }
 
-void rendererInit(float efbScale) {
-    s_scale = efbScale < 1.0f ? 1.0f : efbScale;
-    g_gxStats = g_gxStats || statsEnv();  // settings.txt is read after static initialisation
-    const char* renderer = (const char*)glGetString(GL_RENDERER);
-    logmsg("OpenGL %s, renderer %s (%s)", (const char*)glGetString(GL_VERSION), renderer,
-           (const char*)glGetString(GL_VENDOR));
-    if (renderer && (strstr(renderer, "llvmpipe") || strstr(renderer, "softpipe") || strstr(renderer, "Software")))
-        logmsg("WARNING: %s renders on the CPU and cannot keep the game at full speed. On Linux the 32-bit build "
-               "gets a GPU driver only if its 32-bit GL libraries are installed; the 64-bit build "
-               "(SMS_ARCH=64 ./build.sh) uses the system's driver.", renderer);
-    s_efbW = s_wide > 1.0f ? (int(float(EFB_W) * s_wide + 1.0f) & ~1) : EFB_W;
-    if (const char* e = getenv("SMS_WIDESCREEN_HUD")) s_hudEdges = s_efbW != EFB_W && !strcmp(e, "edges");
-    s_ox = (s_efbW - EFB_W) / 2;
-    if (s_efbW != EFB_W) logmsg("widescreen: EFB %dx%d", s_efbW, EFB_H);
-    int W = scaled(s_efbW), H = scaled(EFB_H);
+// The EFB at the internal resolution s_scale, with s_msaa samples (0: none): the colour and depth
+// textures, and with MSAA the multisampled buffers the game draws into, which are resolved into
+// those. False when the buffers do not fit in the GPU's memory or a framebuffer is incomplete; the
+// caller then frees what is left (efbFree) and builds the last size again. MSAA the driver cannot
+// make a framebuffer of falls back to none, and s_msaa says so.
+static bool efbBuild() {
+    const int W = scaled(s_efbW), H = scaled(EFB_H);
+    while (glGetError() != GL_NO_ERROR) {}
     glGenTextures(1, &s_efbColor);
     glBindTexture(GL_TEXTURE_2D, s_efbColor);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -1117,13 +1123,6 @@ void rendererInit(float efbScale) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    if (const char* e = getenv("SMS_MSAA")) s_msaa = atoi(e);
-    if (s_msaa > 1) {
-        GLint maxSamples = 0;
-        glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
-        s_msaa = std::min(s_msaa, int(maxSamples));
-    }
-    if (s_msaa < 2) s_msaa = 0;
     glGenFramebuffers(1, &s_efbFbo);
     if (s_msaa) {
         glGenRenderbuffers(1, &s_efbMsColor);
@@ -1153,10 +1152,127 @@ void rendererInit(float efbScale) {
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_efbColor, 0);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, s_efbDepth, 0);
     }
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) logmsg("EFB framebuffer incomplete");
+    const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (!complete) logmsg("EFB framebuffer incomplete");
     glClearColor(0, 0, 0, 1);
     glClearDepth(1.0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // a driver that allocates on first use reports a buffer that does not fit here
+    return complete && glGetError() != GL_OUT_OF_MEMORY;
+}
+
+static void efbFree() {
+    const GLuint textures[] = {s_efbColor, s_efbDepth};
+    const GLuint renderbuffers[] = {s_efbMsColor, s_efbMsDepth};
+    const GLuint framebuffers[] = {s_efbFbo, s_efbResolveFbo};
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteTextures(2, textures);
+    glDeleteRenderbuffers(2, renderbuffers);
+    glDeleteFramebuffers(2, framebuffers);
+    s_efbColor = s_efbDepth = s_efbMsColor = s_efbMsDepth = s_efbFbo = s_efbResolveFbo = 0;
+}
+
+static int s_maxSamples = 0;
+static void forgetResolvedEfb();  // after the EFB's buffers are replaced
+static void peekReset();          // after the EFB's width changed
+
+// The EFB's width in game x for a width over 4:3 (a multiple of 2).
+static int efbWidthFor(float wide) { return wide > 1.0f ? (int(float(EFB_W) * wide + 1.0f) & ~1) : EFB_W; }
+
+// Everything the widescreen mapping derives from the width over 4:3. What was drawn under the old
+// mapping is flushed or gone by now, so the per-draw mapping starts over.
+static void setWide(float wide) {
+    s_wide = wide;
+    s_efbW = efbWidthFor(wide);
+    s_ox = (s_efbW - EFB_W) / 2;
+    s_hudEdges = s_hudWanted && s_efbW != EFB_W;
+    s_xmap = XMap();
+    s_stretch2D = false;  // the game's faders set it again when they draw
+    s_hud = false;
+    s_hudPanes.clear();
+    s_hudAnchor = -1.0f;
+}
+
+// Changes the internal resolution, the MSAA sample count and the width over 4:3 while the game
+// runs (the GL thread, between frames, which the settings menu is). What the game drew into the old
+// buffers is gone: the next frame draws the picture again. False, with the old buffers back, when
+// the new ones do not fit or the driver cannot make them.
+static bool efbRebuild(float scale, int msaa, float wide) {
+    scale = std::max(1.0f, std::min(8.0f, scale));
+    msaa = msaa > 1 ? std::min(msaa, s_maxSamples) : 0;
+    wide = wide > 1.0f ? wide : 1.0f;
+    if (scale == s_scale && msaa == s_msaa && wide == s_wide) return true;
+    flushBatch();  // what the game queued for the old buffers
+    const float oldScale = s_scale, oldWide = s_wide;
+    const int oldMsaa = s_msaa, oldWidth = s_efbW;
+    efbFree();
+    s_scale = scale;
+    s_msaa = msaa;
+    if (wide != s_wide) setWide(wide);
+    const bool ok = efbBuild() && s_msaa == msaa;
+    if (!ok) {
+        logmsg("internal resolution %gx with %d samples, %d wide did not fit; back to %gx with %d, %d wide",
+               double(scale), msaa, s_efbW, double(oldScale), oldMsaa, efbWidthFor(oldWide));
+        efbFree();
+        s_scale = oldScale;
+        s_msaa = oldMsaa;
+        if (oldWide != s_wide) setWide(oldWide);
+        if (!efbBuild()) logmsg("the EFB could not be built again");
+    } else {
+        logmsg("internal resolution %gx (%dx%d), %d samples", double(s_scale), scaled(s_efbW), scaled(EFB_H), s_msaa);
+    }
+    glcInvalidate();
+    forgetResolvedEfb();
+    if (s_efbW != oldWidth) peekReset();
+    return ok;
+}
+
+bool rendererResize(float scale, int msaa) { return efbRebuild(scale, msaa, s_wide); }
+
+// The screen format changed (the settings menu, at an area load): the EFB is rebuilt as wide as
+// the format needs. False, with the old one back, when it does not fit.
+bool rendererSetWide(float wide) { return efbRebuild(s_scale, s_msaa, wide); }
+
+// Screen Icons At Edges (GXPC_SetHud): with the gameplay HUD not being drawn, which it is not
+// while the menu runs.
+void rendererSetHudEdges(bool on) {
+    flushBatch();
+    s_hudWanted = on;
+    s_hudEdges = on && s_efbW != EFB_W;
+    s_hud = false;
+    s_hudPanes.clear();
+    s_hudAnchor = -1.0f;
+}
+bool rendererHudEdges() { return s_hudWanted; }
+int rendererMsaa() { return s_msaa; }
+int rendererMaxSamples() { return s_maxSamples; }
+void rendererEfbSize(int* w, int* h) {
+    *w = scaled(s_efbW);
+    *h = scaled(EFB_H);
+}
+
+void rendererInit(float efbScale) {
+    s_scale = efbScale < 1.0f ? 1.0f : efbScale;
+    g_gxStats = g_gxStats || statsEnv();  // settings.txt is read after static initialisation
+    const char* renderer = (const char*)glGetString(GL_RENDERER);
+    logmsg("OpenGL %s, renderer %s (%s)", (const char*)glGetString(GL_VERSION), renderer,
+           (const char*)glGetString(GL_VENDOR));
+    if (renderer && (strstr(renderer, "llvmpipe") || strstr(renderer, "softpipe") || strstr(renderer, "Software")))
+        logmsg("WARNING: %s renders on the CPU and cannot keep the game at full speed. On Linux the 32-bit build "
+               "gets a GPU driver only if its 32-bit GL libraries are installed; the 64-bit build "
+               "(SMS_ARCH=64 ./build.sh) uses the system's driver.", renderer);
+    if (const char* e = getenv("SMS_WIDESCREEN_HUD")) s_hudWanted = !strcmp(e, "edges");
+    setWide(s_wide);
+    if (s_efbW != EFB_W) logmsg("widescreen: EFB %dx%d", s_efbW, EFB_H);
+    {
+        GLint maxSamples = 0;
+        glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
+        s_maxSamples = int(maxSamples);
+    }
+    if (const char* e = getenv("SMS_MSAA")) s_msaa = atoi(e);
+    if (s_msaa > 1) s_msaa = std::min(s_msaa, s_maxSamples);
+    if (s_msaa < 2) s_msaa = 0;
+    efbBuild();
     glGenFramebuffers(1, &s_tmpFbo);
 
     glcInvalidate();
@@ -2200,6 +2316,7 @@ void flushBatch() {
 // resolved since the last draw or clear is not resolved again (the texture
 // copies, the display copy and the peeks of a frame each read the EFB).
 static uint32_t s_resolvedGen = ~0u;  // s_drawGen at the last resolve
+static void forgetResolvedEfb() { s_resolvedGen = ~0u; }
 static GLbitfield s_resolvedBits = 0;
 static int s_resolvedRect[4];
 
@@ -2802,6 +2919,32 @@ static GLuint peekSource(bool depth) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_peekFbo);
     glBlitFramebuffer(0, 0, scaled(s_efbW), scaled(EFB_H), 0, 0, s_efbW, EFB_H, bits, GL_NEAREST);
     return s_peekFbo;
+}
+
+// The EFB's width changed: the snapshots (made at the old width, mapped and indexed by it) and the
+// buffer they are blitted through go, so no peek is answered from a buffer of another shape. The
+// GL thread has run anything it was asked to do with them (see takeFetchedPeek).
+static void peekReset() {
+    for (auto& parity : s_peek)
+        for (auto& group : parity)
+            for (PeekSnap& p : group) {
+                takeFetchedPeek(p);
+                if (p.fence) glDeleteSync(p.fence);
+                if (p.pbo) glDeleteBuffers(1, &p.pbo);  // an unmapped buffer is deleted with its mapping
+                p.pbo = 0;
+                p.fence = 0;
+                p.frame = ~0u;
+                p.map = p.fetched = nullptr;
+            }
+    s_peekDrawGen = s_peekFrame = ~0u;
+    s_peekIssued = 0;
+    s_peekGroup = -1;
+    if (s_peekFbo) {
+        glDeleteFramebuffers(1, &s_peekFbo);
+        glDeleteRenderbuffers(1, &s_peekColor);
+        glDeleteRenderbuffers(1, &s_peekDepth);
+        s_peekFbo = s_peekColor = s_peekDepth = 0;
+    }
 }
 
 // Returns the raw texel: RGBA bytes packed little-endian, or the 32-bit depth.

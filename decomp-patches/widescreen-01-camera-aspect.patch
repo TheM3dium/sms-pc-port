@@ -1,7 +1,7 @@
-Reason: port: SMS_WIDESCREEN widens the game camera's aspect by the displayed width over 4:3, so the view, frustum culling, particles and screen-projected textures all see the wider frame that sms_gx renders
+Reason: port: SMS_WIDESCREEN widens the game camera's aspect by the displayed width over 4:3, so the view, frustum culling, particles and screen-projected textures all see the wider frame that sms_gx renders; the settings menu's Screen Format takes effect here, as an area is made, since the camera takes the width once
 --- a/src/System/MarDirectorSetupObjects.cpp
 +++ b/src/System/MarDirectorSetupObjects.cpp
-@@ -38,6 +38,12 @@
+@@ -38,6 +38,15 @@
  #include <sms_modhook.h>
  #endif
  
@@ -9,16 +9,21 @@ Reason: port: SMS_WIDESCREEN widens the game camera's aspect by the displayed wi
 +// SMS_WIDESCREEN (platform): the displayed width over the GameCube's 4:3, 1
 +// when off. The camera sees that much wider, and sms_gx widens the frame.
 +extern "C" float port_widescreen;
++// The settings menu's Screen Format (sms_gx): rebuilds the frame at the width
++// chosen, if one was, and returns the width in force.
++extern "C" float GXPC_ApplyWidescreen(void) __attribute__((weak));
 +#endif
 +
  extern void* gpSceneCmnDat;
  extern int gpSceneCmnDatSize;
  
-@@ -397,6 +403,9 @@
+@@ -397,6 +406,11 @@
  #endif
  		cam->mAspect = (u16)SMSGetGameVideoWidth() * 0.91346145f
  		               / (u16)SMSGetGameVideoHeight();
 +#ifdef TARGET_PC
++		if (GXPC_ApplyWidescreen)
++			port_widescreen = GXPC_ApplyWidescreen();
 +		cam->mAspect *= port_widescreen;
 +#endif
  	}

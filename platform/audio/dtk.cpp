@@ -13,8 +13,9 @@
 //
 // port_dtk_mix runs where each AI DMA block starts (platform/audio/ai.cpp):
 // it decodes as many stream samples as the block lasts, resampled linearly to
-// the DAC rate, scaled by the volumes (n * vol >> 8, as the hardware) and
-// added to the block's output, and raises the trigger interrupt. It runs with
+// the DAC rate, scaled by the volumes (n * vol >> 8, as the hardware) and by
+// the music volume (dsp_mixer.h: the stream counts as music), added to the
+// block's output, and raises the trigger interrupt. It runs with
 // or without an output, so the stream keeps time as the DMA engine does.
 //
 // ADPCM: 32-byte blocks, a predictor/scale byte for each channel then 28
@@ -24,6 +25,8 @@
 #include "port_os.h"
 #include "port_platform.h"
 #include <dolphin/ai.h>
+
+#include "dsp_mixer.h"
 
 #include <mutex>
 #include <vector>
@@ -50,6 +53,9 @@ struct Dtk {
 	// resampler: the two input frames around the next output frame
 	double t;
 	s16 prevL, prevR, curL, curR;
+	// the music volume (Q15) at the end of the last block, where the next one ramps from
+	bool gainSeen;
+	s32 gain;
 } g;
 
 // s32 is long in the 32-bit build (as CodeWarrior's), so the std::min and
@@ -144,6 +150,10 @@ extern "C" void port_dtk_mix(s16* lr, size_t frames, u32 outRate)
 		if (!g.playing)
 			return;
 		const double step = (AIGetStreamSampleRate() == AI_SAMPLERATE_48KHZ ? 48000.0 : 32000.0) / outRate;
+		const s32 gainTo   = port_dspmix_class_gain(PORT_DSPMIX_CLASS_MUSIC);
+		const s32 gainFrom = g.gainSeen ? g.gain : gainTo;
+		g.gain             = gainTo;
+		g.gainSeen         = true;
 		for (size_t i = 0; i < frames; i++) {
 			while (g.t >= 1.0) {
 				g.t -= 1.0;
@@ -156,8 +166,12 @@ extern "C" void port_dtk_mix(s16* lr, size_t frames, u32 outRate)
 				}
 			}
 			if (lr) {
+				// the music volume (dsp_mixer.h), ramped over the block so a change does not click
+				const s32 gain = gainFrom + (gainTo - gainFrom) * (s32)(i + 1) / (s32)frames;
 				s32 l = (s32)(g.prevL + (g.curL - g.prevL) * g.t) * g.volL >> 8;
 				s32 r = (s32)(g.prevR + (g.curR - g.prevR) * g.t) * g.volR >> 8;
+				l     = (s32)((int64_t)l * gain >> 15);
+				r     = (s32)((int64_t)r * gain >> 15);
 				lr[i * 2]     = (s16)clamp(lr[i * 2] + l, -0x8000, 0x7fff);
 				lr[i * 2 + 1] = (s16)clamp(lr[i * 2 + 1] + r, -0x8000, 0x7fff);
 			}

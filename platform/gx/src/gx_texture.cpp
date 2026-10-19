@@ -471,22 +471,44 @@ uint32_t encodeTexture(const uint8_t* rgba, uint32_t fmt, uint32_t w, uint32_t h
 // sampler bind instead of seven glTexParameter calls.
 static std::unordered_map<uint64_t, GLuint> s_samplers;
 
+static float s_aniso = -1.0f, s_maxAniso = -1.0f;
+
+// The driver's most anisotropic filtering (EXT/ARB_texture_filter_anisotropic, core in GL 4.6); 0
+// when it has none.
+float textureMaxAniso() {
+    if (s_maxAniso >= 0.0f) return s_maxAniso;
+    s_maxAniso = 0.0f;
+    while (glGetError() != GL_NO_ERROR) {}
+    GLint maxAniso = 0;
+    glGetIntegerv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */, &maxAniso);
+    if (glGetError() == GL_NO_ERROR && maxAniso > 1) s_maxAniso = float(maxAniso);
+    return s_maxAniso;
+}
+
 // SMS_ANISO=n: anisotropic filtering for every filtered texture, clamped to
-// the driver's maximum (EXT/ARB_texture_filter_anisotropic, core in GL 4.6).
+// the driver's maximum.
 static float anisotropy() {
-    static float s_aniso = -1.0f;
     if (s_aniso >= 0.0f) return s_aniso;
     s_aniso = 0.0f;
     const char* e = getenv("SMS_ANISO");
     const float want = e ? float(atof(e)) : 0.0f;
     if (want <= 1.0f) return s_aniso;
-    while (glGetError() != GL_NO_ERROR) {}
-    GLint maxAniso = 0;
-    glGetIntegerv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */, &maxAniso);
-    if (glGetError() == GL_NO_ERROR && maxAniso > 1) s_aniso = std::min(want, float(maxAniso));
+    if (textureMaxAniso() > 1.0f) s_aniso = std::min(want, textureMaxAniso());
     if (s_aniso > 1.0f) logmsg("anisotropic filtering %gx", double(s_aniso));
     else logmsg("anisotropic filtering is not supported by this driver");
     return s_aniso;
+}
+
+float textureAniso() { return anisotropy(); }
+
+// Sets the level and drops the samplers, which hold it (and the LOD bias that follows the internal
+// resolution) and are made again as textures bind.
+void textureResetSamplers(float aniso) {
+    anisotropy();  // the level SMS_ANISO asked for is not applied over this one later
+    s_aniso = aniso > 1.0f ? std::min(aniso, textureMaxAniso()) : 0.0f;
+    for (const auto& s : s_samplers) glDeleteSamplers(1, &s.second);
+    s_samplers.clear();
+    glcInvalidate();
 }
 
 // hires: log2 of a texture pack replacement's size over the GX size (-1 for

@@ -27,15 +27,27 @@
 // puts it halfway between the paper white and the peak, 100 at the peak.
 // Anything that fails leaves the usual SDR window and says why in the log.
 //
+// HDR starts with SMS_HDR=1, or later from the settings menu (hdrEnable and hdrDisable each make or release all of
+// this, as often as they are asked). Which thread does what matters: DXGI can send the window messages and wait
+// for the answer, and the game's thread, which runs the window, waits for the GL thread while a frame is presented,
+// so the swap chain is made, resized, presented and released only on the game's thread (never the GL thread's, where
+// a resize or a mode change would wait on a thread that waits on it). The GL thread does OpenGL's share: the
+// interop, the picture's texture, and the frame's drawing into it. While the game runs the swap chain goes in a
+// DirectComposition visual over the window: a window OpenGL has presented in may take no swap chain of its own, and
+// one that did might not give the window back to OpenGL's swap, but a visual leaves the window's own surface alone
+// and can be taken away again. Only at the start does the window get a swap chain of its own first.
+//
 // --display-info (GXPC_PrintDisplayInfo) prints what Windows reports for each
 // display as one line of JSON, for the launcher's HDR settings.
 #include "gx_internal.h"
+#include "gx_settings_extra.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -56,6 +68,7 @@
 
 #include "gl_funcs.h"
 #include "gx_glcache.h"
+#include "gx_glthread.h"
 
 namespace gx {
 unsigned g_presentFbo = 0;
@@ -85,7 +98,10 @@ const int CPT_ICC_ = 0, CPST_EXTENDED_DISPLAY_COLOR_MODE_ = 8;
 
 typedef HRESULT(WINAPI* PFNDCOMPOSITION)(IDXGIDevice* device, REFIID iid, void** out);
 
-bool s_active;
+std::atomic<bool> s_active{false};
+HWND s_hwnd;            // the game's window, from hdrInit
+const char* s_failure;  // why a frame could not be made on the GL thread; the game's thread then stops HDR
+bool s_lookMade;        // the look is the environment's to start with, then the settings menu's
 ID3D11Device* s_dev;
 ID3D11DeviceContext* s_ctx;
 IDXGISwapChain3* s_chain;
@@ -113,6 +129,25 @@ int s_pboNext;
 int s_w, s_h;
 bool s_tearing;
 float s_paper = 200, s_peak = 1000, s_contrast = 1, s_saturation = 1, s_highlights = 0.4f;
+// Paper white and peak are what Windows reports (s_autoPaper, s_autoPeak) with calibration on,
+// else the ones chosen (s_manualPaper, s_manualPeak). The settings menu changes any of these while
+// the game runs; s_paramsDirty has the next frame send them to the shader.
+bool s_calibration = true, s_paramsDirty;
+float s_autoPaper = 200, s_autoPeak = 1000, s_manualPaper = 200, s_manualPeak = 1000;
+
+// s_paper and s_peak, from the calibration choice (the peak is never below the paper white)
+void applyNits() {
+    s_paper = s_calibration ? s_autoPaper : s_manualPaper;
+    s_peak = s_calibration ? s_autoPeak : s_manualPeak;
+    if (s_peak < s_paper) s_peak = s_paper;
+}
+
+// kHdrHlsl's constant buffer
+void shaderParams(float out[8]) {
+    const float params[8] = {s_paper / 80.0f, s_peak / 80.0f, s_contrast, s_saturation,
+                             s_peak > s_paper ? powf(s_peak / s_paper, s_highlights) : 1.0f, 0, 0, 0};
+    memcpy(out, params, sizeof params);
+}
 
 // The picture to scRGB, linear BT.709 with 1.0 at 80 nits. OpenGL wrote it
 // bottom row first. It is decoded with a 2.2 gamma (the TVs the game was made
@@ -216,7 +251,8 @@ ConfigInfo configInfo(const wchar_t* gdiName) {
         white.header.id = paths[i].targetInfo.id;
         // SDRWhiteLevel is 1000 for 80 nits
         if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS) info.sdrWhite = float(white.SDRWhiteLevel) * 80.0f / 1000.0f;
-        if (HMODULE mscms = LoadLibraryW(L"mscms.dll")) {
+        static HMODULE mscms = LoadLibraryW(L"mscms.dll");  // loaded once: each call would count it up
+        if (mscms) {
             auto getProfile = reinterpret_cast<PFNPROFILE>(reinterpret_cast<void*>(GetProcAddress(mscms, "ColorProfileGetDisplayDefault")));
             for (int scope = 1; getProfile && scope >= 0 && info.profile.empty(); scope--) {  // the user's, then the system's
                 LPWSTR name = nullptr;
@@ -288,6 +324,12 @@ float envNits(const char* name, float fallback) {
     return v >= 10.0f && v <= 10000.0f ? v : fallback;
 }
 
+// Whether the variable gives a number (not auto, and in range).
+bool envNitsGiven(const char* name) { return envNits(name, -1.0f) >= 0.0f; }
+
+// Percent, as the settings menu changes it (the same ranges as the environment's)
+float clampedPercent(float v, float lo, float hi) { return std::max(lo, std::min(hi, v)) / 100.0f; }
+
 float envPercent(const char* name, float lo, float hi, float fallback) {
     const char* e = getenv(name);
     if (!e || !*e) return fallback;
@@ -324,30 +366,48 @@ void releasePicture() {
     s_pboFilled[0] = s_pboFilled[1] = false;
 }
 
-void releaseTargets() {
+// OpenGL's share of ending HDR, on the GL thread: the picture and the interop device.
+void releaseGl() {
     releasePicture();
-    if (s_ctx) s_ctx->ClearState();  // nothing may hold the back buffer when it is resized
-    release(s_backView);
-    s_w = s_h = 0;
-}
-
-void stop(const char* why) {
-    logmsg("HDR: %s; the game shows in SDR", why);
-    releaseTargets();
     if (s_dxDevice) wglDXCloseDevice(s_dxDevice);
     s_dxDevice = nullptr;
+    gx::glcInvalidate();  // the picture's names and framebuffer are gone
+}
+
+void releaseComposition() {
+    release(s_dcompVisual);
+    release(s_dcompTarget);
+    release(s_dcomp);
+}
+
+// Releases everything HDR made and gives the window back to OpenGL's swap, on the game's thread (the swap chain
+// is made, used and released only there, see the top of this file). It takes whatever was made so far, so it also
+// cleans up after a start that failed.
+void teardown() {
+    gx::glt::sync([] { releaseGl(); });
+    if (s_ctx) {
+        s_ctx->ClearState();  // nothing may hold the back buffer
+        s_ctx->Flush();
+    }
+    release(s_backView);
     release(s_d3d10State);
     release(s_ctx1);
     release(s_params);
     release(s_ps);
     release(s_vs);
-    release(s_dcompVisual);
-    release(s_dcompTarget);
-    release(s_dcomp);
+    releaseComposition();
     release(s_chain);
     release(s_ctx);
     release(s_dev);
+    s_w = s_h = 0;
+    s_failure = nullptr;
+    gx::g_presentFbo = 0;
     s_active = false;
+}
+
+void stop(const char* why) {
+    logmsg("HDR: %s; the game shows in SDR", why);
+    teardown();
 }
 
 // The interop functions, and the interop device for s_dev. On AMD, first the
@@ -483,10 +543,11 @@ bool makeCopy(int w, int h) {
     return ok;
 }
 
-// The swap chain's buffers and the picture's textures, all w x h. A texture
-// the driver will not share switches to the copy for the rest of the game.
-bool makeTargets(int w, int h) {
-    releaseTargets();
+// The swap chain's buffers, w x h, and a view of the back buffer (the game's thread).
+bool makeBackBuffer(int w, int h) {
+    s_ctx->ClearState();  // nothing may hold the back buffer when it is resized
+    s_ctx->Flush();
+    release(s_backView);
     HRESULT hr = s_chain->ResizeBuffers(2, UINT(w), UINT(h), DXGI_FORMAT_R16G16B16A16_FLOAT,
                                         s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     ID3D11Texture2D* back = nullptr;
@@ -497,6 +558,13 @@ bool makeTargets(int w, int h) {
         logmsg("HDR: the %dx%d swap chain buffers failed (0x%08lx)", w, h, hr);
         return false;
     }
+    return true;
+}
+
+// The picture's textures, w x h (the GL thread). A texture the driver will not share switches to the copy for the
+// rest of the game.
+bool makePicture(int w, int h) {
+    releasePicture();
     if (!s_copy && !makeShared(w, h)) {
         releasePicture();
         s_copy = true;
@@ -505,10 +573,18 @@ bool makeTargets(int w, int h) {
     bool ok = !s_copy || makeCopy(w, h);
     ok = ok && SUCCEEDED(s_dev->CreateShaderResourceView(s_picture, nullptr, &s_pictureView));
     gx::glcInvalidate();
-    if (!ok) {
-        logmsg("HDR: the %dx%d picture textures failed", w, h);
-        return false;
-    }
+    if (!ok) logmsg("HDR: the %dx%d picture textures failed", w, h);
+    return ok;
+}
+
+// Both, for a window of w x h, on the game's thread: the swap chain is DXGI's, and the textures are made by the GL
+// thread. A frame is in neither while this runs.
+bool makeTargets(int w, int h) {
+    s_w = s_h = 0;
+    if (!makeBackBuffer(w, h)) return false;
+    bool ok = false;
+    gx::glt::sync([&] { ok = makePicture(w, h); });
+    if (!ok) return false;
     s_w = w;
     s_h = h;
     return true;
@@ -542,7 +618,7 @@ void copyPicture() {
 
 // kHdrHlsl's shaders (d3dcompiler_47.dll is part of Windows), and its settings.
 bool makeShaders() {
-    HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
+    static HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");  // loaded once: each call would count it up
     auto compile = dll ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(GetProcAddress(dll, "D3DCompile"))) : nullptr;
     if (!compile) {
         logmsg("HDR: no d3dcompiler_47.dll");
@@ -563,11 +639,11 @@ bool makeShaders() {
     ok = ok && SUCCEEDED(s_dev->CreatePixelShader(code[1]->GetBufferPointer(), code[1]->GetBufferSize(), nullptr, &s_ps));
     release(code[0]);
     release(code[1]);
-    const float params[8] = {s_paper / 80.0f, s_peak / 80.0f, s_contrast, s_saturation,
-                             s_peak > s_paper ? powf(s_peak / s_paper, s_highlights) : 1.0f, 0, 0, 0};
+    float params[8];
+    shaderParams(params);
     D3D11_BUFFER_DESC desc = {};
     desc.ByteWidth = sizeof params;
-    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.Usage = D3D11_USAGE_DEFAULT;  // hdrFramePresent rewrites it when the settings menu changes a value
     desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     D3D11_SUBRESOURCE_DATA data = {};
     data.pSysMem = params;
@@ -577,7 +653,7 @@ bool makeShaders() {
 // A swap chain for a DirectComposition visual over the window, for a window
 // that takes none of its own.
 HRESULT compositionSwapChain(IDXGIFactory2* factory, HWND hwnd, DXGI_SWAP_CHAIN_DESC1 desc, IDXGISwapChain1** chain) {
-    HMODULE dll = LoadLibraryW(L"dcomp.dll");
+    static HMODULE dll = LoadLibraryW(L"dcomp.dll");  // loaded once: each call would count it up
     auto create =
         dll ? reinterpret_cast<PFNDCOMPOSITION>(reinterpret_cast<void*>(GetProcAddress(dll, "DCompositionCreateDevice"))) : nullptr;
     IDXGIDevice* dxgi = nullptr;
@@ -595,9 +671,9 @@ HRESULT compositionSwapChain(IDXGIFactory2* factory, HWND hwnd, DXGI_SWAP_CHAIN_
     return hr;
 }
 
-// The scRGB swap chain: the window's own, or else one in a DirectComposition
-// visual over it.
-bool makeSwapChain(HWND hwnd) {
+// The scRGB swap chain: in a DirectComposition visual over the window, or the window's own. compositionFirst
+// tries the visual first (see the top of this file for why), the window's own after it; else the other way round.
+bool makeSwapChain(HWND hwnd, bool compositionFirst) {
     IDXGIFactory2* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory)))) {
         logmsg("HDR: no DXGI factory");
@@ -621,13 +697,26 @@ bool makeSwapChain(HWND hwnd) {
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Flags = s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     IDXGISwapChain1* chain = nullptr;
-    HRESULT hr = factory->CreateSwapChainForHwnd(s_dev, hwnd, &desc, nullptr, nullptr, &chain);
-    if (SUCCEEDED(hr)) {
-        factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
-    } else {
-        logmsg("HDR: the window takes no swap chain (0x%08lx); trying DirectComposition", hr);
+    HRESULT hr = E_FAIL;
+    if (compositionFirst) {
         hr = compositionSwapChain(factory, hwnd, desc, &chain);
-        if (FAILED(hr)) logmsg("HDR: no DirectComposition swap chain either (0x%08lx)", hr);
+        if (FAILED(hr)) {
+            logmsg("HDR: no DirectComposition swap chain (0x%08lx); trying the window's own", hr);
+            releaseComposition();
+            release(chain);
+        }
+    }
+    if (FAILED(hr)) {
+        hr = factory->CreateSwapChainForHwnd(s_dev, hwnd, &desc, nullptr, nullptr, &chain);
+        if (SUCCEEDED(hr)) {
+            factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+        } else if (compositionFirst) {
+            logmsg("HDR: the window takes no swap chain either (0x%08lx)", hr);
+        } else {
+            logmsg("HDR: the window takes no swap chain (0x%08lx); trying DirectComposition", hr);
+            hr = compositionSwapChain(factory, hwnd, desc, &chain);
+            if (FAILED(hr)) logmsg("HDR: no DirectComposition swap chain either (0x%08lx)", hr);
+        }
     }
     factory->Release();
     if (SUCCEEDED(hr)) hr = chain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&s_chain));
@@ -635,17 +724,23 @@ bool makeSwapChain(HWND hwnd) {
     return SUCCEEDED(hr);
 }
 
-}  // namespace
-
-namespace gx {
-
-bool hdrActive() { return s_active; }
-
-bool hdrInit(void* window) {
-    const char* want = getenv("SMS_HDR");
-    if (!want || !*want || !strcmp(want, "0") || s_active) return false;
-    HWND hwnd = static_cast<HWND>(window);
+// Whether Windows HDR is on for the monitor that shows hwnd, as DXGI reports it.
+bool monitorShowsHdr(HWND hwnd) {
     const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    std::vector<OutputInfo> list = outputs();
+    bool hdr = false;
+    for (const OutputInfo& o : list)
+        if (o.monitor == monitor && o.hdr) hdr = true;
+    releaseOutputs(list);
+    return hdr;
+}
+
+// Makes everything HDR needs and starts presenting through it, on the game's thread (which runs the window; the GL
+// thread does OpenGL's share, through glt::sync). False, with the reason in the log and nothing left made, when it
+// cannot. The look is the environment's the first time and what the settings menu left after that; the nits Windows
+// reports are asked again each time, as the window may be on another display.
+bool bringUp(bool compositionFirst) {
+    const HMONITOR monitor = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST);
     std::vector<OutputInfo> list = outputs();
     const OutputInfo* out = nullptr;
     for (const OutputInfo& o : list)
@@ -656,12 +751,21 @@ bool hdrInit(void* window) {
         return false;
     }
     const ConfigInfo config = configInfo(out->gdiName.c_str());
-    s_paper = envNits("SMS_HDR_PAPER_WHITE", config.sdrWhite >= 80.0f ? config.sdrWhite : 200.0f);
-    s_peak = envNits("SMS_HDR_PEAK", out->peakNits >= 100.0f ? out->peakNits : 1000.0f);
-    if (s_peak < s_paper) s_peak = s_paper;
-    s_contrast = envPercent("SMS_HDR_CONTRAST", 50, 150, 1.0f);
-    s_saturation = envPercent("SMS_HDR_SATURATION", 0, 200, 1.0f);
-    s_highlights = envPercent("SMS_HDR_HIGHLIGHTS", 0, 100, 0.4f);
+    s_autoPaper = config.sdrWhite >= 80.0f ? config.sdrWhite : 200.0f;
+    s_autoPeak = out->peakNits >= 100.0f ? out->peakNits : 1000.0f;
+    if (!s_lookMade) {
+        s_lookMade = true;
+        // calibration is both auto (the launcher's setting); a number for either takes them from the settings
+        s_calibration = !envNitsGiven("SMS_HDR_PAPER_WHITE") && !envNitsGiven("SMS_HDR_PEAK");
+        s_manualPaper = envNits("SMS_HDR_PAPER_WHITE", s_autoPaper);
+        s_manualPeak = envNits("SMS_HDR_PEAK", s_autoPeak);
+        s_contrast = envPercent("SMS_HDR_CONTRAST", 50, 150, 1.0f);
+        s_saturation = envPercent("SMS_HDR_SATURATION", 0, 200, 1.0f);
+        s_highlights = envPercent("SMS_HDR_HIGHLIGHTS", 0, 100, 0.4f);
+    }
+    applyNits();
+    if (GetWindowThreadProcessId(s_hwnd, nullptr) != GetCurrentThreadId())
+        logmsg("HDR: not on the window's thread, so DXGI may wait for window messages that nothing here answers");
 
     DXGI_ADAPTER_DESC1 adapter = {};
     out->adapter->GetDesc1(&adapter);
@@ -684,11 +788,15 @@ bool hdrInit(void* window) {
     }
     const char* copy = getenv("SMS_HDR_COPY");
     s_copy = copy && *copy && strcmp(copy, "0") != 0;
-    if (!s_copy && !openInterop(adapter.VendorId == 0x1002)) {
-        s_copy = true;
-        logmsg("HDR: copying each frame to Direct3D through system memory instead, a frame behind");
+    if (!s_copy) {
+        bool shared = false;
+        gx::glt::sync([&] { shared = openInterop(adapter.VendorId == 0x1002); });  // the GL thread's context
+        if (!shared) {
+            s_copy = true;
+            logmsg("HDR: copying each frame to Direct3D through system memory instead, a frame behind");
+        }
     }
-    if (!makeSwapChain(hwnd)) {
+    if (!makeSwapChain(s_hwnd, compositionFirst)) {
         stop("no Direct3D swap chain for the window");
         return false;
     }
@@ -696,6 +804,7 @@ bool hdrInit(void* window) {
         stop("the swap chain cannot take scRGB");
         return false;
     }
+    s_failure = nullptr;
     s_active = true;
     logmsg("HDR on: scRGB through Direct3D 11 on %s (%s%s), paper white %.0f nits, peak %.0f nits, contrast %.0f%%, "
            "saturation %.0f%%, highlights %.0f%% (SDR white at %.0f nits)%s",
@@ -706,36 +815,122 @@ bool hdrInit(void* window) {
     return true;
 }
 
-bool hdrFrameBegin(int w, int h) {
-    if (!s_active || w <= 0 || h <= 0) return false;
+}  // namespace
+
+namespace gx {
+
+bool hdrActive() { return s_active; }
+
+HdrLook hdrLook() {
+    HdrLook look;
+    look.calibration = s_calibration;
+    look.paperWhite = s_manualPaper;
+    look.peak = s_manualPeak;
+    look.contrast = s_contrast * 100.0f;
+    look.saturation = s_saturation * 100.0f;
+    look.highlights = s_highlights * 100.0f;
+    look.autoPaperWhite = s_autoPaper;
+    look.autoPeak = s_autoPeak;
+    return look;
+}
+
+void hdrSetLook(const HdrLook& look) {
+    if (!s_active) return;
+    s_calibration = look.calibration;
+    s_manualPaper = std::max(10.0f, std::min(10000.0f, look.paperWhite));
+    s_manualPeak = std::max(10.0f, std::min(10000.0f, look.peak));
+    s_contrast = clampedPercent(look.contrast, 50, 150);
+    s_saturation = clampedPercent(look.saturation, 0, 200);
+    s_highlights = clampedPercent(look.highlights, 0, 100);
+    applyNits();
+    s_paramsDirty = true;
+    logmsg("HDR: paper white %.0f nits, peak %.0f nits%s, contrast %.0f%%, saturation %.0f%%, highlights %.0f%%",
+           double(s_paper), double(s_peak), s_calibration ? " (from Windows)" : "", double(s_contrast * 100),
+           double(s_saturation * 100), double(s_highlights * 100));
+}
+
+bool hdrInit(void* window) {
+    s_hwnd = static_cast<HWND>(window);
+    const char* want = getenv("SMS_HDR");
+    if (!want || !*want || !strcmp(want, "0") || s_active) return false;
+    return s_hwnd && bringUp(false);
+}
+
+bool hdrEnable() {
+    if (s_active) return true;
+    if (!s_hwnd) return false;
+    return bringUp(true);
+}
+
+void hdrDisable() {
+    if (!s_active) return;
+    logmsg("HDR off: the game shows in SDR");
+    teardown();
+}
+
+bool hdrCanEnable() {
+    if (s_active) return true;
+    if (!s_hwnd) return false;
+    // the menu asks every frame it is open, for each row: Windows is asked once a second
+    static ULONGLONG asked;
+    static bool answer;
+    const ULONGLONG now = GetTickCount64();
+    if (asked == 0 || now - asked >= 1000) {
+        asked = now ? now : 1;
+        answer = monitorShowsHdr(s_hwnd);
+    }
+    return answer;
+}
+
+bool hdrFramePrepare(int w, int h) {
+    if (!s_active) return false;
+    if (s_failure) {  // the GL thread could not go on with the last frame
+        stop(s_failure);
+        return false;
+    }
+    if (w <= 0 || h <= 0) return false;
     if ((w != s_w || h != s_h) && !makeTargets(w, h)) {
         stop("the frame's textures could not be made");
         return false;
     }
-    if (s_dxObject && !wglDXLockObjects(s_dxDevice, 1, &s_dxObject)) {
-        logmsg("HDR: the shared texture could not be locked (error %lu); copying each frame instead", GetLastError());
-        releasePicture();
-        s_copy = true;
-        if (!makeTargets(w, h)) {
-            stop("the frame's textures could not be made");
-            return false;
-        }
-    }
-    g_presentFbo = s_pictureFbo;
     return true;
 }
 
-void hdrFramePresent(int vsync) {
+bool hdrFrameBegin() {
+    if (!s_active || s_failure || !s_pictureView) return false;
+    if (s_dxObject && !wglDXLockObjects(s_dxDevice, 1, &s_dxObject)) {
+        logmsg("HDR: the shared texture could not be locked (error %lu); copying each frame instead", GetLastError());
+        s_copy = true;
+        if (!makePicture(s_w, s_h)) {
+            s_failure = "the frame's textures could not be made";
+            return false;
+        }
+    }
+    gx::g_presentFbo = s_pictureFbo;
+    return true;
+}
+
+void hdrFrameEnd() {
     g_presentFbo = 0;
     if (!s_active) return;
     if (s_dxObject) wglDXUnlockObjects(s_dxDevice, 1, &s_dxObject);
     else copyPicture();
+}
+
+void hdrFramePresent(int vsync) {
+    if (!s_active || !s_backView) return;
     const D3D11_VIEWPORT viewport = {0, 0, float(s_w), float(s_h), 0, 1};
     s_ctx->OMSetRenderTargets(1, &s_backView, nullptr);
     s_ctx->RSSetViewports(1, &viewport);
     s_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     s_ctx->VSSetShader(s_vs, nullptr, 0);
     s_ctx->PSSetShader(s_ps, nullptr, 0);
+    if (s_paramsDirty) {
+        float params[8];
+        shaderParams(params);
+        s_ctx->UpdateSubresource(s_params, 0, nullptr, params, 0, 0);
+        s_paramsDirty = false;
+    }
     s_ctx->PSSetConstantBuffers(0, 1, &s_params);
     s_ctx->PSSetShaderResources(0, 1, &s_pictureView);
     s_ctx->Draw(3, 0);
@@ -772,12 +967,19 @@ extern "C" void GXPC_PrintDisplayInfo(void) {
 
 namespace gx {
 bool hdrActive() { return false; }
+HdrLook hdrLook() { return HdrLook(); }
+void hdrSetLook(const HdrLook&) {}
 bool hdrInit(void*) {
     const char* want = getenv("SMS_HDR");
     if (want && *want && strcmp(want, "0") != 0) logmsg("HDR: only on Windows so far; the game shows in SDR");
     return false;
 }
-bool hdrFrameBegin(int, int) { return false; }
+bool hdrEnable() { return false; }
+void hdrDisable() {}
+bool hdrCanEnable() { return false; }
+bool hdrFramePrepare(int, int) { return false; }
+bool hdrFrameBegin() { return false; }
+void hdrFrameEnd() {}
 void hdrFramePresent(int) {}
 }  // namespace gx
 

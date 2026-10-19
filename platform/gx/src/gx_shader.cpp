@@ -808,12 +808,13 @@ static void programCacheStore(const ProgramKey& key, uint64_t srcHash, GLuint p)
 // Nothing is compiled between frames: with the driver compiling, the GPU
 // fences frames wait for (EFB copies) are held up for whole compiles.
 // Programs the cache already holds cost nothing. SMS_GX_SHADER_WARMUP=0 turns
-// it off.
+// it off, and the settings menu does either from the next stage's load.
 #include "gx_shader_keys.inc"
 
 static const int kStageBoot = 0xFE, kStageAny = 0xFF;
 static int s_stage = kStageBoot;  // the stage loaded last (shaderPrepareStage)
-static int s_warmState = -1;      // -1 not set up, 0 off, 1 on
+static int s_warmState = -1;      // -1 not set up, 0 unusable here, 1 its tables are loaded
+static bool s_warmWanted = true;  // SMS_GX_SHADER_WARMUP, then the settings menu
 static bool s_parallel = false;   // the driver compiles in the background
 static std::vector<ProgramKey> s_warmKeys;                    // each once
 static std::unordered_map<int, std::vector<size_t>> s_stageKeys;  // a stage's, in s_warmKeys
@@ -911,7 +912,7 @@ static void warmDrain() {
 static void warmSetup() {
     s_warmState = 0;
     const char* e = getenv("SMS_GX_SHADER_WARMUP");
-    if (e && (!strcmp(e, "0") || !strcmp(e, "off"))) return;
+    s_warmWanted = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));  // off still loads the tables, for the menu
     if (kWarmLayout != kShaderKeyLayout || kWarmKeySize != sizeof(ProgramKey) || kWarmFormat != 2) {
         logmsg("shader warm-up: off (gx_shader_keys.inc is for key layout %u of %u bytes, not %u of %zu)",
                unsigned(kWarmLayout), unsigned(kWarmKeySize), unsigned(kShaderKeyLayout), sizeof(ProgramKey));
@@ -963,8 +964,9 @@ static void warmSetup() {
     size_t cached = 0;
     for (const ProgramKey& k : s_warmKeys) cached += s_programs.count(k);
     s_warmState = 1;
-    logmsg("shader warm-up: %zu known programs, %zu cached%s", s_warmKeys.size(), cached,
-           s_parallel ? ", compiled in parallel" : "");
+    if (s_warmWanted)
+        logmsg("shader warm-up: %zu known programs, %zu cached%s", s_warmKeys.size(), cached,
+               s_parallel ? ", compiled in parallel" : "");
 }
 
 // SMS_GX_SHADER_KEYS=file appends each program key a stage draws with, once
@@ -1000,7 +1002,7 @@ void shaderPrepareStage(int stage) {
     if (s_cacheState < 0) shaderSetup();
     s_stage = stage & 0xFF;
     s_lastProgram = nullptr;  // so the stage's first key is recorded
-    if (s_warmState != 1) return;
+    if (s_warmState != 1 || !s_warmWanted) return;
     const auto start = std::chrono::steady_clock::now();
     auto elapsed = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); };
     auto finish = [] {
@@ -1029,6 +1031,10 @@ void shaderPrepareStage(int stage) {
         logmsg("shader warm-up: compiled %u programs for stage %d and %u others in %.1f ms%s", own, s_stage,
                s_warmMade - before - own, elapsed(), s_warmNext < s_warmKeys.size() ? "" : " (all known programs made)");
 }
+
+bool shaderWarmupAvailable() { return s_warmState == 1; }
+bool shaderWarmupWanted() { return s_warmWanted; }
+void shaderSetWarmup(bool on) { s_warmWanted = on; }
 
 // ------------------------------------------------------------------ lines
 // GX draws a line as a quad GXSetLineWidth sixths of an EFB pixel wide,

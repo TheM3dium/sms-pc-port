@@ -57,6 +57,10 @@ int GXPC_GameInputBlocked(void);
 /* The quit key: opens the "are you sure" prompt, whose Quit button exits.
  * 0 without a window (headless), where the caller exits straight away. */
 int GXPC_RequestQuit(void);
+/* The game's settings menu (src/settings_menu.cpp) is open (1) or closed (0). Like the cheat and
+ * warp menus it frees the mouse mouse look holds, and mouse look takes it back when the menu
+ * closes; the game keeps reading the pad. Call it on open and on close. */
+void GXPC_SettingsMenuOpen(int open);
 /* Widescreen: the displayed width over the GameCube's 4:3 (1 = off). Set
  * before the context exists; the EFB, the display and the window widen, and
  * draws map the game's 640-wide coordinates into it (see gx_render.cpp). The
@@ -76,6 +80,10 @@ void GXPC_SetHud(int on);
 void GXPC_HudPaneBegin(float x1, float x2);
 void GXPC_HudPaneEnd(void);
 float GXPC_GetWidescreen(void);
+/* The settings menu's Screen Format only picks a width (platform/gx gx_settings_extra.cpp). The game
+ * calls this where it sets its camera's aspect, as an area is made: the frame is rebuilt at the
+ * chosen width (nothing is drawn in between) and the width now in force over 4:3 is returned. */
+float GXPC_ApplyWidescreen(void);
 
 /* Input hook for the PAD layer.  sms_gx_pump_events handles SDL's events (it is
  * also called after every present), opens game controllers as they appear and

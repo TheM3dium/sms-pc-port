@@ -205,6 +205,18 @@ It opens on the area you are in; L and R step through the others you have been t
 The counts are the game's: an area's eight episodes and its 100-coin and two other Shines, the Airstrip's two, and the Plaza's other 41; 30 blue coins in each area, 20 in the Plaza (the Airstrip's one included) and 10 on Corona Mountain.
 `pause_tracker = off` in `settings.txt` (`SMS_PAUSE_TRACKER=0`) hides it. Eclipse builds have Eclipse's own tracker instead.
 
+### Settings menu
+
+The launcher's settings can be changed while you play. Pause the game, then press Y (F by default) at the pause menu's top right, under LOAD SAVE STATE, where it reads **SETTINGS**. The menu is drawn by the game in its own lettering and plays the pause menu's sounds. It has a page for each of the launcher's panes (**Graphics**, **Display**, **Gameplay**, **Controls**): up and down choose, left and right (or A) change an option or open a page, B goes back; hold X to hide the menu and look at the picture.
+Changes apply at once, behind the menu, and last until the game closes: they are the options of the same names in the launcher and `settings.txt`, which still set what the game starts with. The menu lists only what this computer can do (anisotropic filtering up to the card's limit, fullscreen resolutions the display offers, HDR only on an HDR display), and keeps the old setting when a new resolution or sample count does not fit in the card's memory.
+
+- **Graphics:** a preset (Low, Medium, High, Ultra, as in the launcher), resolution, anti-aliasing, FXAA, anisotropic filtering, sharpening, the upscaler and its quality, HD textures and how they load, shader warm-up and the heat-wave effect.
+- **Display:** fullscreen, its type, resolution and monitor, screen format, screen icons at the edges, aspect ratio, brightness, frame rate, V-Sync, the performance overlay, and HDR with its settings (HDR can be turned on only where Windows HDR is on for the display).
+- **Gameplay:** skipping cutscenes, volume, separate music and sound effect volumes (`SMS_MUSIC_VOLUME`, `SMS_SFX_VOLUME`, or `music_volume` and `sfx_volume` in `settings.txt`; music is every tune the game's music sequences play, jingles included, and movie sound, and everything else is sound effects), the camera (invert, free camera, speed) and mouse look and its sensitivity.
+- **Controls:** soft trigger depth, rumble strength, and the button prompts and the controller they follow.
+
+A few take effect later: the **frame rate** from the next area (it is chosen as an area loads, so 120 can be chosen only when the game started at 120), the **screen format** as the next area loads (the camera is set up then), HD texture loading and shader warm-up as areas load. Language packs, Super Mario Eclipse, HD cutscenes, key and controller bindings and the launcher's own options (updates, Discord, theme) stay in the launcher: they are set before the game starts.
+
 ### Save states
 
 A save state is the game at one moment: in a level, F5 or L1 + R1 (LB + RB) saves it. The pause menu shows those buttons at its top right with **LOAD SAVE STATE**: press them there to open the list of states, newest first, with a picture of each; A loads one, Y deletes it, B goes back. F6 loads the newest without the menu. The buttons show as your keyboard or controller shows them, from the launcher's button prompt pictures (their names without the launcher).

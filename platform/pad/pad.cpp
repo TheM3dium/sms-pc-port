@@ -12,6 +12,8 @@
 #include "port_platform.h"
 #include "port_savestate.h"
 #include "gc_adapter.h"
+#include "port_setting_list.h"
+#include "port_settings.h"
 #include <dolphin/pad.h>
 #include <string.h>
 #include <strings.h>
@@ -1003,6 +1005,169 @@ extern "C" int port_camera_take_mouse(f32* dx, f32* dy)
 		*dy = -*dy;
 	g_mouseDX = g_mouseDY = 0;
 	return 1;
+}
+
+// --- Settings menu (port_settings.h) ---
+// Every pad option lives in state that only the emulated CPU's thread touches: PADRead and
+// PADControlMotor, and the window events (they arrive through sms_gx_pump_events, which PADRead
+// and the frame present call on that thread). The menu's set() runs on the same thread while the
+// game is paused, so a plain store is enough; the camera code reads the globals each frame. The
+// GameCube adapter's own thread only reads gcad::g_state, which update_rumble writes atomically.
+namespace {
+
+int off_on_count() { return 2; }
+const char* off_on_name(int i) { return i ? "On" : "Off"; }
+
+const char* percent_name(const PortValueList& l, int i)
+{
+	static char text[16];
+	snprintf(text, sizeof text, "%d", l.v[i < 0 ? 0 : i >= l.n ? l.n - 1 : i]);
+	return text;
+}
+
+// The launcher's values come from the standard steps, plus the one the game started with.
+PortValueList g_cameraSpeedList, g_mouseSensList, g_softTriggerList, g_rumbleList;
+
+int camera_speed_percent() { return (int)(port_camera_speed_x * 100.0f + 0.5f); }
+int mouse_sens_percent() { return (int)(g_mouseSens * 100.0f + 0.5f); }
+// The press depth is kept as 0..255, from percent * 255 / 100; this undoes that rounding.
+int soft_trigger_percent() { return (g_softTrigger * 100 + 127) / 255; }
+// 0 is off (SMS_RUMBLE=0 starts with the strength at 0 too, so one number says both).
+int rumble_percent() { return (int)(((u32)g_rumbleStrength * 100 + 0x7FFF) / 0xFFFF); }
+
+const PortValueList& camera_speed_list()
+{
+	static const int steps[] = { 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300 };
+	if (!g_cameraSpeedList.built) {
+		init(); // the start values come from the environment
+		g_cameraSpeedList.build(steps, (int)(sizeof steps / sizeof steps[0]), camera_speed_percent());
+	}
+	return g_cameraSpeedList;
+}
+
+const PortValueList& mouse_sens_list()
+{
+	static const int steps[] = { 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400 };
+	if (!g_mouseSensList.built) {
+		init();
+		g_mouseSensList.build(steps, (int)(sizeof steps / sizeof steps[0]), mouse_sens_percent());
+	}
+	return g_mouseSensList;
+}
+
+const PortValueList& soft_trigger_list()
+{
+	static const int steps[] = { 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95 };
+	if (!g_softTriggerList.built) {
+		init();
+		g_softTriggerList.build(steps, (int)(sizeof steps / sizeof steps[0]), soft_trigger_percent());
+	}
+	return g_softTriggerList;
+}
+
+const PortValueList& rumble_list()
+{
+	static const int steps[] = { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
+	if (!g_rumbleList.built) {
+		init();
+		g_rumbleList.build(steps, (int)(sizeof steps / sizeof steps[0]), rumble_percent());
+	}
+	return g_rumbleList;
+}
+
+int invert_x_get() { return g_invert_cx; }
+int invert_x_set(int v) { g_invert_cx = v != 0; return 1; }
+int invert_y_get() { return g_invert_cy; }
+int invert_y_set(int v) { g_invert_cy = v != 0; return 1; }
+int free_camera_get() { return port_free_camera != 0; }
+int free_camera_set(int v) { port_free_camera = v != 0; return 1; }
+
+int camera_speed_count() { return camera_speed_list().n; }
+const char* camera_speed_name(int i) { return percent_name(camera_speed_list(), i); }
+int camera_speed_get() { return camera_speed_list().indexOf(camera_speed_percent()); }
+int camera_speed_set(int i)
+{
+	const PortValueList& l = camera_speed_list();
+	if (i < 0 || i >= l.n)
+		return 0;
+	port_camera_speed_x = port_camera_speed_y = (f32)l.v[i] / 100.0f;
+	return 1;
+}
+
+int mouse_sens_count() { return mouse_sens_list().n; }
+const char* mouse_sens_name(int i) { return percent_name(mouse_sens_list(), i); }
+int mouse_sens_get() { return mouse_sens_list().indexOf(mouse_sens_percent()); }
+int mouse_sens_set(int i)
+{
+	const PortValueList& l = mouse_sens_list();
+	if (i < 0 || i >= l.n)
+		return 0;
+	g_mouseSens = (float)l.v[i] / 100.0f;
+	return 1;
+}
+
+int soft_trigger_count() { return soft_trigger_list().n; }
+const char* soft_trigger_name(int i) { return percent_name(soft_trigger_list(), i); }
+int soft_trigger_get() { return soft_trigger_list().indexOf(soft_trigger_percent()); }
+int soft_trigger_set(int i)
+{
+	const PortValueList& l = soft_trigger_list();
+	if (i < 0 || i >= l.n)
+		return 0;
+	g_softTrigger = l.v[i] * 255 / 100; // as init() does
+	return 1;
+}
+
+int rumble_count() { return rumble_list().n; }
+const char* rumble_name(int i)
+{
+	const PortValueList& l = rumble_list();
+	return i >= 0 && i < l.n && l.v[i] == 0 ? "Off" : percent_name(l, i);
+}
+int rumble_get() { return rumble_list().indexOf(rumble_percent()); }
+int rumble_set(int i)
+{
+	const PortValueList& l = rumble_list();
+	if (i < 0 || i >= l.n)
+		return 0;
+	// A strength above 0 is all it takes to turn the motor back on from Off: update_rumble's only
+	// switches are the game's own motor request, focus and this strength. It is sent at once, so a
+	// motor the game has running follows the new strength.
+	g_rumbleStrength = (u16)(l.v[i] * 0xFFFF / 100);
+	update_rumble();
+	return 1;
+}
+
+const PortSetting kPadSettings[] = {
+	{ "softTrigger", PORT_SETTINGS_PAGE_CONTROLS, 10, "Soft Trigger Depth",
+	  "How far the soft L and R keys press, out of 100. Only if they are bound.", 0, NULL, soft_trigger_count,
+	  soft_trigger_name, soft_trigger_get, soft_trigger_set },
+	{ "rumbleStrength", PORT_SETTINGS_PAGE_CONTROLS, 20, "Rumble Strength",
+	  "Rumble strength. Off turns it off. Some adapters are on or off only.", 0, NULL, rumble_count,
+	  rumble_name, rumble_get, rumble_set },
+	{ "invertCameraX", PORT_SETTINGS_PAGE_GAMEPLAY, 50, "Invert Camera X",
+	  "Flips the C-stick and mouse look left and right.", 0, NULL, off_on_count, off_on_name, invert_x_get,
+	  invert_x_set },
+	{ "invertCameraY", PORT_SETTINGS_PAGE_GAMEPLAY, 55, "Invert Camera Y",
+	  "Flips the C-stick and mouse look up and down.", 0, NULL, off_on_count, off_on_name, invert_y_get,
+	  invert_y_set },
+	{ "freeCamera", PORT_SETTINGS_PAGE_GAMEPLAY, 60, "Free Camera",
+	  "The camera stays where you put it instead of swinging back behind Mario.", 0, NULL, off_on_count,
+	  off_on_name, free_camera_get, free_camera_set },
+	{ "cameraSpeed", PORT_SETTINGS_PAGE_GAMEPLAY, 70, "Camera Speed",
+	  "How fast the C-stick turns the camera. 100 is the original speed.", 0, NULL, camera_speed_count,
+	  camera_speed_name, camera_speed_get, camera_speed_set },
+	{ "mouseSensitivity", PORT_SETTINGS_PAGE_GAMEPLAY, 85, "Mouse Sensitivity",
+	  "How fast mouse look turns the camera, when mouse look is on. 100 is normal.", 0, NULL, mouse_sens_count,
+	  mouse_sens_name, mouse_sens_get, mouse_sens_set },
+};
+
+} // namespace
+
+extern "C" const PortSetting* port_pad_settings(int* count)
+{
+	*count = (int)(sizeof kPadSettings / sizeof kPadSettings[0]);
+	return kPadSettings;
 }
 
 // PADClamp comes from the decomp (libs/dolphin/src/pad/Padclamp.c, see CMakeLists.txt).

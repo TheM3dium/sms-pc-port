@@ -174,6 +174,48 @@ const uint8_t* promptImage(int glyph, int* style) {
     return a->rgba[glyph].data();
 }
 
+// The settings menu's choices (gx_settings_extra.cpp), changed while the game runs. Every bind of a
+// button picture and every glyph the font draws asks for the style again, so a change shows at the
+// next draw. The style is 0 the game's own (GameCube), 1 automatic, then Xbox, PlayStation, Steam
+// Deck and keyboard; the pad is 0 matched to the controller, then GameCube, Xbox, PlayStation, Steam
+// Deck.
+bool promptsAvailable() {
+    init();
+    return !s_dir.empty();
+}
+
+int promptsStyle() {
+    init();
+    if (s_auto) return 1;
+    return s_fixed == S_GAMECUBE ? 0 : s_fixed + 1;
+}
+
+// False when the style's pictures cannot be read (the old style stays).
+bool promptsSetStyle(int style) {
+    init();
+    if (style < 0 || style > S_COUNT) return false;
+    if (style >= 2 && !atlas(style - 1)) return false;
+    s_auto = style == 1;
+    if (style != 1) s_fixed = style == 0 ? S_GAMECUBE : style - 1;
+    if (s_auto) logmsg("button prompts: automatic, controllers as %s", s_pad < 0 ? "matched" : kStyleNames[s_pad]);
+    else logmsg("button prompts: %s", kStyleNames[s_fixed]);
+    return true;
+}
+
+int promptsPad() {
+    init();
+    return s_pad + 1;
+}
+
+bool promptsSetPad(int pad) {
+    init();
+    if (pad < 0 || pad > S_STEAMDECK + 1) return false;
+    if (pad >= 2 && !atlas(pad - 1)) return false;
+    s_pad = pad - 1;
+    if (s_auto) logmsg("button prompts: automatic, controllers as %s", s_pad < 0 ? "matched" : kStyleNames[s_pad]);
+    return true;
+}
+
 }  // namespace gx
 
 extern "C" {

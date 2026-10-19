@@ -150,6 +150,57 @@ enum PrimClass { PRIM_TRIS, PRIM_LINES, PRIM_POINTS };
 void rendererInit(float efbScale);
 float efbScale();  // the internal resolution over the GameCube's
 void flushBatch();
+
+// Changes made while the game runs, by the settings menu (gx_settings.cpp), on the GL thread.
+// The picture's post-processing: the scaler is 0 bilinear/area, 1 nearest, 2 sharp, 3 FSR 1, 4 NIS.
+struct PostSettings {
+    bool fxaa = false;
+    int filter = 0;        // 0 bilinear/area, 1 nearest, 2 sharp, 3 fsr, 4 nis
+    float sharpen = 0.0f;  // 0..1
+    float gamma = 1.0f;
+    int aspect = 0;        // 0 keep, 1 stretch, 2 integer
+};
+PostSettings postSettings();
+void postApply(const PostSettings& settings);
+// The internal resolution (a scale of 640x528) and MSAA samples (0: none); false, with the old
+// ones kept, when the new buffers do not fit.
+bool rendererResize(float scale, int msaa);
+int rendererMsaa();
+int rendererMaxSamples();
+void rendererEfbSize(int* w, int* h);
+// Anisotropic filtering of every filtered texture (gx_texture.cpp): the driver's most, and the
+// level in force; setting it (and the internal resolution, which the LOD bias of an effect's mips
+// follows) makes the samplers again.
+float textureMaxAniso();
+float textureAniso();
+void textureResetSamplers(float aniso);
+// The window (gx_platform.cpp). Vsync is 0 off, 1 on, -1 adaptive; platformSetVsync is for the GL
+// thread and false where the driver has no adaptive vsync (then it is on). Fullscreen only asks:
+// the event pump changes the window.
+bool platformHasWindow();
+int platformVsync();
+bool platformSetVsync(int mode);
+bool platformFullscreen();
+void platformRequestFullscreen(bool on);
+// The fullscreen type (exclusive switches the display to a size, else borderless), the size it switches to
+// (0 x 0: the desktop's), the displays (0 is the primary) and the one the window is on, and mouse look:
+// what is asked counts until the event pump has done it, and these only ask.
+bool platformExclusive();
+void platformRequestExclusive(bool on);
+struct DisplaySize { int w, h; };
+void platformFullscreenSize(int* w, int* h);
+void platformRequestFullscreenSize(int w, int h);
+std::vector<DisplaySize> platformFullscreenSizes(int display);  // at the desktop's refresh rate, ascending, each once
+int platformDisplayCount();
+int platformDisplay();
+void platformRequestDisplay(int index);
+bool platformMouseLook();
+void platformRequestMouseLook(bool on);
+// FSR 1 and NIS modes (0 native, 1 quality, 2 balanced, 3 performance, 4 ultra performance): the one
+// SMS_FSR_MODE named or -1, and the internal resolution a mode makes for the picture as it is on screen
+// now (0 without a window).
+int platformFsrModeAtStart();
+float platformFsrScale(int mode);
 // adds a primitive; vertices already decoded
 // Packed vertex formats: a vertex holds only the attributes its GX vertex
 // descriptor enables (position always); see vtxFmtLayout in gx_fifo.cpp.
@@ -210,11 +261,17 @@ uint32_t pixMetricRead();
 struct TexKey;
 unsigned bindTextureMap(int map, float* outW, float* outH);  // returns GL name
 // HDR output (gx_hdr.cpp). Presenting draws into g_presentFbo: 0 (the window),
-// or, while HDR is on, the texture Direct3D turns into the HDR picture.
+// or, while HDR is on, the texture Direct3D turns into the HDR picture. Direct3D's swap chain is only
+// ever used on the game's thread, the one that runs the window (DXGI may wait for it), so a frame is:
+// hdrFramePrepare (the game's thread: settles the picture's size to the window's; false when there is nothing to show,
+// and ends HDR when it cannot go on), hdrFrameBegin and hdrFrameEnd (the GL thread, around the frame's drawing),
+// and hdrFramePresent (the game's thread again: Direct3D draws the picture and presents it).
 extern unsigned g_presentFbo;
 bool hdrActive();
-bool hdrInit(void* window);  // the window's native handle (an HWND on Windows)
-bool hdrFrameBegin(int w, int h);
+bool hdrInit(void* window);  // the window's native handle (an HWND on Windows); starts HDR if SMS_HDR asks
+bool hdrFramePrepare(int w, int h);
+bool hdrFrameBegin();
+void hdrFrameEnd();
 void hdrFramePresent(int vsync);
 void textureInvalidateAll();
 void textureInvalidateRange(const void* p, uint32_t size);

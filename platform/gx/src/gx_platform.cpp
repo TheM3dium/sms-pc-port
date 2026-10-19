@@ -14,6 +14,8 @@
 #include "gx_window_layout.h"
 #include "sms_gx/gx_pc.h"
 
+#include <atomic>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,6 +81,12 @@ double s_presentCost = 0;
 const double kSkipPresentCost = 0.002;
 double s_lastPresent = 0;  // the last display copy's present, 0 when skipped
 int s_vsync = 0;
+std::atomic<int> s_fullscreenRequest{-1};  // the settings menu's: 1 fullscreen, 0 window, -1 none; the event pump applies it
+// The same, for the rest of what the settings menu changes in the window: the fullscreen type (1 exclusive,
+// 0 borderless), the exclusive size (width << 16 | height, 0 for the desktop's), the display to be on, and
+// mouse look (1 on, 0 off); -1 for none. The event pump applies them.
+std::atomic<int> s_exclusiveRequest{-1}, s_sizeRequest{-1}, s_displayRequest{-1}, s_mouseLookRequest{-1};
+std::atomic<bool> s_settingsMenuOpen{false};  // GXPC_SettingsMenuOpen: the game's settings menu is up
 uint32_t s_frame = 0;
 // SMS_GX_BACKEND=vulkan (or --vulkan): the renderer's GL calls go to glvk
 // (src/vk), on Vulkan; when Vulkan cannot start, OpenGL as usual.
@@ -183,6 +191,9 @@ void captureMouse(bool on) {
 // desktop's mode). F11 or Alt+Enter toggles between the window and that
 // fullscreen (desktop when SMS_FULLSCREEN is unset).
 bool s_exclusive = false, s_isFullscreen = false;
+// The size exclusive fullscreen switches the display to (SMS_FULLSCREEN_MODE, or the settings menu's): 0 x 0
+// is the desktop's, and the refresh rate is the desktop's unless SMS_FULLSCREEN_MODE named one.
+int s_fsW = 0, s_fsH = 0, s_fsHz = 0;
 #ifdef _WIN32
 BorderlessWindow s_borderless;
 #endif
@@ -252,13 +263,10 @@ void setFullscreen(bool on) {
         SDL_DisplayMode want = {}, got = {};
         const int display = std::max(0, SDL_GetWindowDisplayIndex(s_window));
         SDL_GetDesktopDisplayMode(display, &want);
-        if (const char* e = getenv("SMS_FULLSCREEN_MODE")) {
-            int w = 0, h = 0, hz = 0;
-            if (sscanf(e, "%dx%d@%d", &w, &h, &hz) >= 2 && w > 0 && h > 0) {
-                want.w = w;
-                want.h = h;
-                if (hz > 0) want.refresh_rate = hz;
-            }
+        if (s_fsW > 0 && s_fsH > 0) {
+            want.w = s_fsW;
+            want.h = s_fsH;
+            if (s_fsHz > 0) want.refresh_rate = s_fsHz;
         }
         if (SDL_GetClosestDisplayMode(display, &want, &got)) SDL_SetWindowDisplayMode(s_window, &got);
         flags = SDL_WINDOW_FULLSCREEN;
@@ -286,11 +294,13 @@ void setFullscreen(bool on) {
     SDL_ShowCursor(on ? SDL_DISABLE : SDL_ENABLE);
 }
 
-// An open menu (cheats, warps or the quit prompt) has a free cursor; closing
-// it gives mouse look back the capture it had.
-bool s_menuOpen = false, s_capturedBeforeMenu = false;
+// An open menu (cheats, warps, the quit prompt or the game's settings menu) has a free mouse; closing it
+// gives mouse look back the capture it had. The cheat and warp menus and the quit prompt also show the
+// cursor, which they click with.
+bool s_menuOpen = false, s_capturedBeforeMenu = false, s_menuCursor = false;
 
 bool menuVisible() { return cheatMenuVisible() || warpMenuVisible() || quitPromptVisible(); }
+bool mouseFree() { return menuVisible() || s_settingsMenuOpen; }
 // Fullscreen (borderless or exclusive) hides the cursor. When F10 releases
 // mouse look the cursor must come back, or the release looks like it did
 // nothing; capturing it again hides it as before.
@@ -302,17 +312,90 @@ void showReleasedCursor() {
 bool s_warpToggleHeld[2];
 
 void syncMenuInput() {
-    const bool open = menuVisible();
+    const bool cursor = menuVisible();
+    if (cursor != s_menuCursor) {
+        s_menuCursor = cursor;
+        SDL_ShowCursor(cursor || !s_isFullscreen ? SDL_ENABLE : SDL_DISABLE);
+    }
+    const bool open = mouseFree();
     if (open == s_menuOpen) return;
     s_menuOpen = open;
     if (open) {
         s_capturedBeforeMenu = s_mouseCaptured;
         captureMouse(false);
-        SDL_ShowCursor(SDL_ENABLE);
         return;
     }
-    SDL_ShowCursor(s_isFullscreen ? SDL_DISABLE : SDL_ENABLE);
     if (s_capturedBeforeMenu && (SDL_GetWindowFlags(s_window) & SDL_WINDOW_INPUT_FOCUS)) captureMouse(true);
+}
+
+// Mouse look on or off while the game runs (the settings menu's). Turned on in a menu, it takes the mouse
+// when the menu closes.
+void applyMouseLook(bool on) {
+    if (on == s_mouseCamera) return;
+    s_mouseCamera = on;
+    s_mouseReleased = false;
+    if (on) {
+        logmsg("mouse look on (F10 releases the mouse)");
+        if (mouseFree()) s_capturedBeforeMenu = true;
+        else captureMouse((SDL_GetWindowFlags(s_window) & SDL_WINDOW_INPUT_FOCUS) != 0);
+        return;
+    }
+    logmsg("mouse look off");
+    captureMouse(false);  // frees it: with mouse look off there is nothing to capture for
+    s_capturedBeforeMenu = false;
+    if (!s_menuCursor) SDL_ShowCursor(s_isFullscreen ? SDL_DISABLE : SDL_ENABLE);
+}
+
+// Puts the window, not fullscreen, in the middle of another display's usable area, smaller if it does not fit.
+void moveToDisplay(int display) {
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(display, &usable) != 0 && SDL_GetDisplayBounds(display, &usable) != 0) return;
+    WindowBorders borders = {48, 8, 8, 8};
+    if (SDL_GetWindowBordersSize(s_window, &borders.top, &borders.left, &borders.bottom, &borders.right) != 0)
+        borders = {48, 8, 8, 8};
+    int w = 0, h = 0;
+    SDL_GetWindowSize(s_window, &w, &h);
+    const int roomW = std::max(1, usable.w - borders.left - borders.right);
+    const int roomH = std::max(1, usable.h - borders.top - borders.bottom);
+    if (w > roomW || h > roomH) {
+        const double fit = std::min(double(roomW) / w, double(roomH) / h);
+        w = std::max(1, int(w * fit));
+        h = std::max(1, int(h * fit));
+        SDL_SetWindowSize(s_window, w, h);
+    }
+    SDL_SetWindowPosition(s_window,
+        usable.x + (usable.w - w - borders.left - borders.right) / 2 + borders.left,
+        usable.y + (usable.h - h - borders.top - borders.bottom) / 2 + borders.top);
+    SDL_PumpEvents();  // where the window is now decides the display fullscreen then uses
+}
+
+// What the settings menu asked of the window and the mouse since the last pump (gx_settings.cpp). A
+// fullscreen window that changes type, size or display leaves fullscreen and enters it again.
+void applyWindowRequests() {
+    const int fullscreen = s_fullscreenRequest.exchange(-1);
+    const int exclusive = s_exclusiveRequest.exchange(-1);
+    const int size = s_sizeRequest.exchange(-1);
+    const int display = s_displayRequest.exchange(-1);
+    const int look = s_mouseLookRequest.exchange(-1);
+    bool restyle = false;
+    if (exclusive >= 0 && (exclusive != 0) != s_exclusive) {
+        s_exclusive = exclusive != 0;
+        restyle = true;
+    }
+    if (size >= 0 && ((size >> 16) != s_fsW || (size & 0xffff) != s_fsH)) {
+        s_fsW = size >> 16;
+        s_fsH = size & 0xffff;
+        s_fsHz = 0;
+        restyle = restyle || s_exclusive;
+    }
+    const bool wasFullscreen = s_isFullscreen;
+    const bool moving = display >= 0 && display < SDL_GetNumVideoDisplays() && display != SDL_GetWindowDisplayIndex(s_window);
+    if (wasFullscreen && (restyle || moving)) setFullscreen(false);
+    if (moving && !s_isFullscreen) moveToDisplay(display);
+    const bool want = fullscreen >= 0 ? fullscreen != 0 : wasFullscreen;
+    if (want != s_isFullscreen) setFullscreen(want);
+    syncMenuInput();
+    if (look >= 0) applyMouseLook(look != 0);
 }
 
 void applyIcon() {
@@ -335,22 +418,37 @@ char s_windowError[256];    // and its SDL error
 // from the picture's width on screen (outW x outH pixels): native renders it
 // at that width, quality at 1/1.5 of it, balanced 1/1.7, performance 1/2 and
 // ultraperformance 1/3, and FSR 1 or NIS upscales the rest of the way. Never below
-// the GameCube's own resolution, nor above 8 times it.
+// the GameCube's own resolution, nor above 8 times it. The settings menu does the same
+// for a mode it picks (platformFsrScale), from the window as it is then.
+const struct { const char* name; float ratio; } kFsrModes[] = {
+    {"native", 1.0f}, {"quality", 1.5f}, {"balanced", 1.7f}, {"performance", 2.0f}, {"ultraperformance", 3.0f}};
+const int kFsrModeCount = int(sizeof kFsrModes / sizeof kFsrModes[0]);
+
+// The internal resolution that draws the picture at 1/ratio of its width on screen; the picture is as
+// wide as the window, or as the window's height allows at the game's shape unless it is stretched.
+float fsrInternalScale(float ratio, float outW, float outH, bool stretch, float* picWidth) {
+    const float wide = GXPC_GetWidescreen();
+    const float aspect = 4.0f / 3.0f * wide;
+    const float picW = stretch ? outW : std::min(outW, outH * aspect);
+    if (picWidth) *picWidth = picW;
+    return std::max(1.0f, std::min(8.0f, picW / (640.0f * wide * ratio)));
+}
+
+int fsrModeByName(const char* mode) {
+    for (int i = 0; i < kFsrModeCount; i++)
+        if (mode && !strcmp(mode, kFsrModes[i].name)) return i;
+    return -1;
+}
+
 static float fsrScale(float scale, float outW, float outH) {
     const char* filter = getenv("SMS_PRESENT_FILTER");
     const char* mode = getenv("SMS_FSR_MODE");
     if (!filter || (strcmp(filter, "fsr") != 0 && strcmp(filter, "nis") != 0) || !mode || !*mode) return scale;
-    static const struct { const char* name; float ratio; } kModes[] = {
-        {"native", 1.0f}, {"quality", 1.5f}, {"balanced", 1.7f}, {"performance", 2.0f}, {"ultraperformance", 3.0f}};
-    float ratio = 0.0f;
-    for (const auto& m : kModes)
-        if (!strcmp(mode, m.name)) ratio = m.ratio;
-    if (ratio <= 0.0f || outW <= 0.0f || outH <= 0.0f) return scale;
-    const float wide = GXPC_GetWidescreen();
-    const float aspect = 4.0f / 3.0f * wide;
+    const int index = fsrModeByName(mode);
+    if (index < 0 || outW <= 0.0f || outH <= 0.0f) return scale;
     const char* fit = getenv("SMS_ASPECT");
-    const float picW = fit && !strcmp(fit, "stretch") ? outW : std::min(outW, outH * aspect);
-    const float s = std::max(1.0f, std::min(8.0f, picW / (640.0f * wide * ratio)));
+    float picW = 0.0f;
+    const float s = fsrInternalScale(kFsrModes[index].ratio, outW, outH, fit && !strcmp(fit, "stretch"), &picW);
     logmsg("%s %s: the picture is %d pixels wide on screen, so internal resolution scale %.2f",
            strcmp(filter, "nis") == 0 ? "NIS" : "FSR 1", mode,
            int(picW + 0.5f), double(s));
@@ -548,6 +646,14 @@ bool openWindow(float scale, bool vulkan) {
     // Exclusive fullscreen switches the display to the mode asked for.
     const char* fullscreen = getenv("SMS_FULLSCREEN");
     s_exclusive = fullscreen && strcmp(fullscreen, "exclusive") == 0;
+    if (const char* e = getenv("SMS_FULLSCREEN_MODE")) {
+        int w = 0, h = 0, hz = 0;
+        if (sscanf(e, "%dx%d@%d", &w, &h, &hz) >= 2 && w > 0 && h > 0) {
+            s_fsW = std::min(w, 0xffff);
+            s_fsH = std::min(h, 0xffff);
+            s_fsHz = std::max(hz, 0);
+        }
+    }
     if (windowsHdrOn()) logmsg("Windows HDR is on for this monitor");
     if (envTrue("SMS_FULLSCREEN")) setFullscreen(true);
 #ifdef _WIN32
@@ -797,6 +903,139 @@ void releaseGlThread() {
     glt::stop();
 #endif
 }
+
+// What the settings menu (gx_settings.cpp) changes in the window. 0 when there is no window.
+bool platformHasWindow() { return s_mode == MODE_WINDOW; }
+int platformVsync() { return s_vsync; }  // 0 off, 1 on, -1 adaptive
+// The GL thread: the swap interval is the context's. Adaptive is on where the driver has no adaptive
+// vsync, and the call says so by returning false.
+bool platformSetVsync(int mode) {
+    s_vsync = mode;
+#ifdef SMS_GX_HAVE_SDL2
+    if (s_mode != MODE_WINDOW || hdrActive()) return true;  // HDR waits for the display itself (hdrFramePresent)
+    if (SDL_GL_SetSwapInterval(mode) != 0 && mode < 0) {
+        SDL_GL_SetSwapInterval(1);
+        s_vsync = 1;
+        return false;
+    }
+#endif
+    return true;
+}
+// What the window is, or will be when the event pump has done what was asked of it.
+bool platformFullscreen() {
+#ifdef SMS_GX_HAVE_SDL2
+    const int asked = s_fullscreenRequest;
+    return asked >= 0 ? asked != 0 : s_isFullscreen;
+#else
+    return false;
+#endif
+}
+// The window is the event pump's: this only asks, and the next pump does it.
+void platformRequestFullscreen(bool on) { s_fullscreenRequest = on ? 1 : 0; }
+
+// The fullscreen type: exclusive (the display switches to a size) or borderless. As with fullscreen, what
+// is asked counts until the pump has done it.
+bool platformExclusive() {
+#ifdef SMS_GX_HAVE_SDL2
+    const int asked = s_exclusiveRequest;
+    return asked >= 0 ? asked != 0 : s_exclusive;
+#else
+    return false;
+#endif
+}
+void platformRequestExclusive(bool on) { s_exclusiveRequest = on ? 1 : 0; }
+
+// The size exclusive fullscreen switches to; 0 x 0 is the desktop's.
+void platformFullscreenSize(int* w, int* h) {
+#ifdef SMS_GX_HAVE_SDL2
+    const int asked = s_sizeRequest;
+    *w = asked >= 0 ? asked >> 16 : s_fsW;
+    *h = asked >= 0 ? asked & 0xffff : s_fsH;
+#else
+    *w = *h = 0;
+#endif
+}
+void platformRequestFullscreenSize(int w, int h) {
+    s_sizeRequest = (std::min(std::max(w, 0), 0xffff) << 16) | std::min(std::max(h, 0), 0xffff);
+}
+// The sizes a display can switch to at its desktop's refresh rate (every mode when the driver names none
+// at it), each once, ascending.
+std::vector<DisplaySize> platformFullscreenSizes(int display) {
+    std::vector<DisplaySize> sizes;
+#ifdef SMS_GX_HAVE_SDL2
+    if (s_mode != MODE_WINDOW) return sizes;
+    SDL_DisplayMode desktop = {};
+    if (SDL_GetDesktopDisplayMode(display, &desktop) != 0) return sizes;
+    const int modes = SDL_GetNumDisplayModes(display);
+    for (int pass = 0; pass < 2 && sizes.empty(); pass++)
+        for (int i = 0; i < modes; i++) {
+            SDL_DisplayMode m = {};
+            if (SDL_GetDisplayMode(display, i, &m) != 0 || m.w <= 0 || m.h <= 0) continue;
+            if (pass == 0 && m.refresh_rate != desktop.refresh_rate) continue;
+            sizes.push_back({m.w, m.h});
+        }
+    std::sort(sizes.begin(), sizes.end(),
+              [](const DisplaySize& a, const DisplaySize& b) { return a.w != b.w ? a.w < b.w : a.h < b.h; });
+    sizes.erase(std::unique(sizes.begin(), sizes.end(),
+                            [](const DisplaySize& a, const DisplaySize& b) { return a.w == b.w && a.h == b.h; }),
+                sizes.end());
+#else
+    (void)display;
+#endif
+    return sizes;
+}
+
+// The displays (0 is the primary one, SDL's order), and the one the window is on, or will be.
+int platformDisplayCount() {
+#ifdef SMS_GX_HAVE_SDL2
+    return s_mode == MODE_WINDOW ? std::max(0, SDL_GetNumVideoDisplays()) : 0;
+#else
+    return 0;
+#endif
+}
+int platformDisplay() {
+#ifdef SMS_GX_HAVE_SDL2
+    const int asked = s_displayRequest;
+    if (asked >= 0) return asked;
+    return s_mode == MODE_WINDOW && s_window ? std::max(0, SDL_GetWindowDisplayIndex(s_window)) : 0;
+#else
+    return 0;
+#endif
+}
+void platformRequestDisplay(int index) { s_displayRequest = std::max(0, index); }
+
+// Mouse look (SMS_MOUSE_CAMERA).
+bool platformMouseLook() {
+#ifdef SMS_GX_HAVE_SDL2
+    const int asked = s_mouseLookRequest;
+    return asked >= 0 ? asked != 0 : s_mouseCamera;
+#else
+    return false;
+#endif
+}
+void platformRequestMouseLook(bool on) { s_mouseLookRequest = on ? 1 : 0; }
+
+// FSR 1 and NIS modes (see fsrScale): the one SMS_FSR_MODE named, or -1; and the internal resolution a mode
+// makes for the picture as it is on screen now, 0 where there is no window to measure.
+int platformFsrModeAtStart() {
+#ifdef SMS_GX_HAVE_SDL2
+    return fsrModeByName(getenv("SMS_FSR_MODE"));
+#else
+    return -1;
+#endif
+}
+float platformFsrScale(int mode) {
+#ifdef SMS_GX_HAVE_SDL2
+    if (s_mode != MODE_WINDOW || !s_window || mode < 0 || mode >= kFsrModeCount) return 0.0f;
+    int w = 0, h = 0;
+    SDL_GL_GetDrawableSize(s_window, &w, &h);
+    if (w <= 0 || h <= 0) return 0.0f;
+    return fsrInternalScale(kFsrModes[mode].ratio, float(w), float(h), postSettings().aspect == 1, nullptr);
+#else
+    (void)mode;
+    return 0.0f;
+#endif
+}
 }  // namespace gx
 
 extern "C" {
@@ -859,6 +1098,9 @@ int GXPC_RequestQuit(void) {
     return 0;
 #endif
 }
+// The game's settings menu is up (1) or closed (0): like the cheat and warp menus, it frees the mouse
+// that mouse look holds, and mouse look takes it back when the menu closes. The event pump does it.
+void GXPC_SettingsMenuOpen(int open) { s_settingsMenuOpen = open != 0; }
 int GXPC_IsHeadless(void) { return s_mode != MODE_WINDOW; }
 uint32_t GXPC_FrameCount(void) { return s_frame; }
 
@@ -928,6 +1170,11 @@ void GXPC_Present(const void* xfb) {
 #endif
             SDL_GL_GetDrawableSize(s_window, &w, &h);
         double t0 = 0, t1 = 0, tSwapped = 0;
+        // HDR (gx_hdr.cpp): Direct3D's swap chain is used on this thread, the window's, because DXGI may wait
+        // for the window's thread, which must not be the one waiting for the GL thread below. So the picture's
+        // size is settled here, and Direct3D presents here once the GL thread has drawn the picture. Settling
+        // it can end HDR (then this frame goes to the window as usual).
+        const bool hdrReady = hdrActive() && hdrFramePrepare(w, h);
         const bool hdr = hdrActive();
         // on the GL thread, after what the frame queued before (the frame's
         // own work, which is not timed as presenting); this thread waits for
@@ -936,7 +1183,7 @@ void GXPC_Present(const void* xfb) {
         const double waited0 = glt::waitedSeconds();
         glt::sync([&] {
             t0 = nowSeconds();
-            if (hdr && !hdrFrameBegin(w, h)) {  // minimised: nothing to show
+            if (hdr && !(hdrReady && hdrFrameBegin())) {  // minimised: nothing to show
                 shown = false;
                 return;
             }
@@ -952,7 +1199,7 @@ void GXPC_Present(const void* xfb) {
             extOverlayRender(w, h);
             captureWindow(s_frame, w, h);
             t1 = nowSeconds();
-            if (hdr) hdrFramePresent(s_vsync != 0);
+            if (hdr) hdrFrameEnd();
 #ifdef SMS_GX_HAVE_VULKAN
             else if (s_vulkan) glvk::present();
 #endif
@@ -965,6 +1212,11 @@ void GXPC_Present(const void* xfb) {
             g_presentDrain += std::max(0.0, waited - (shown ? tSwapped - t0 : 0.0));
         }
         if (!shown) return;
+        if (hdr) {  // Direct3D's part of the swap, with its wait for the display
+            const double tPresent = nowSeconds();
+            hdrFramePresent(s_vsync != 0);
+            tSwapped += nowSeconds() - tPresent;
+        }
         const double tBack = nowSeconds();
         waitSimulatedRefresh();
         double t2 = nowSeconds();
@@ -1019,6 +1271,7 @@ static void noteInputDevice(const SDL_Event& ev) {
 void sms_gx_pump_events(void) {
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode != MODE_WINDOW) return;
+    applyWindowRequests();
     // Controllers are read over SDL's joystick lock, which the rumble thread
     // holds through a send: during one, only the events already queued are
     // handled, and the rest wait for the next frame instead of the game.
@@ -1101,7 +1354,7 @@ void sms_gx_pump_events(void) {
                 continue;
             }
         }
-        if (s_mouseCamera && !menuVisible()) {
+        if (s_mouseCamera && !mouseFree()) {
             if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) captureMouse(false);
             if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED && !s_mouseReleased)
                 captureMouse(true);

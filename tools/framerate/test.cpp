@@ -5,6 +5,7 @@
 int port_frame_rate = 60;
 int port_active_frame_rate = 30;
 int port_high_fps_active = 0;
+int port_vi_multiplier = 1;
 
 int main()
 {
@@ -17,6 +18,7 @@ int main()
     for (unsigned r = 0; r < 3; ++r) {
         port_frame_rate = port_parse_frame_rate(values[r]);
         assert(port_frame_rate == rates[r]);
+        port_vi_multiplier = rates[r] == 120 ? 2 : 1; // as port_init latches it at start
         port_active_frame_rate = rates[r];
         port_high_fps_active = rates[r] > 30;
         unsigned ticks = 0, native_counts = 0;

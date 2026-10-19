@@ -289,9 +289,14 @@ add_library(sms_game STATIC ${SMS_DECOMP_CXX_SOURCES} ${SMS_DECOMP_C_SOURCES})
 include(${CMAKE_CURRENT_SOURCE_DIR}/platform/thp/thp.cmake)
 # The SDK's PADClamp (dead zone / octagon), built from the decomp as C.
 target_sources(sms_game PRIVATE ${SMS_DECOMP}/libs/dolphin/src/pad/Padclamp.c)
-# The save state menu, drawn by the game in its pause menu with the game's
-# own font and art, so it is built as game code (port_savestate_menu.h).
-target_sources(sms_game PRIVATE ${SMS_PORT_SRC}/savestate_menu.cpp)
+# The port's menus, drawn by the game in its pause menu with the game's own
+# font and art, so they are built as game code: the save state menu
+# (port_savestate_menu.h), the settings menu (port_settings_menu.h) and
+# what they draw with (port_menu_draw.h).
+target_sources(sms_game PRIVATE
+  ${SMS_PORT_SRC}/menu_draw.cpp
+  ${SMS_PORT_SRC}/savestate_menu.cpp
+  ${SMS_PORT_SRC}/settings_menu.cpp)
 # The pause menu's Shine and blue coin tracker, drawn the same way
 # (port_pause_tracker.h).
 target_sources(sms_game PRIVATE ${SMS_PORT_SRC}/pause_tracker.cpp)

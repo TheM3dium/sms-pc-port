@@ -36,6 +36,7 @@
 
 #include "port_framerate.h"
 #include "port_savestate.h"
+#include "port_menu_draw.h"
 #include "port_savestate_menu.h"
 
 namespace {
@@ -70,155 +71,11 @@ u8 sAlpha;       // the pause menu's fade
 u32 sTicks;      // frames open, for the selected row's bounce
 char sNote[96];
 
+using namespace PortMenu;
+
 // the HUD's art, from game_6 (loaded with every stage)
-JUTTexture sBrush, sShine, sBlueCoin, sCoin, sLife, sCursor, sCross, sDigit[10];
+Art sArt;
 bool sHaveArt;
-
-bool loadArt(JUTTexture& tex, const char* name)
-{
-	char path[64];
-	snprintf(path, sizeof path, "/game_6/timg/%s.bti", name);
-	const ResTIMG* timg = (const ResTIMG*)JKRGetResource(path);
-	if (!timg)
-		return false;
-	tex.storeTIMG(timg);
-	return true;
-}
-
-// --- drawing: quads as JUTResFont draws its glyphs --------------------------
-
-enum { LEFT, CENTRE, RIGHT };
-
-void colourOf(u32 c, u8 alpha, GXColor* out)
-{
-	out->r = c >> 24;
-	out->g = c >> 16;
-	out->b = c >> 8;
-	out->a = (u8)(((c & 0xFF) * alpha) / 255);
-}
-
-// The corners of a w x h box centred on (cx, cy), turned `degrees`
-// anticlockwise as seen, in drawing order.
-void corners(f32 cx, f32 cy, f32 w, f32 h, f32 degrees, f32 out[4][2])
-{
-	const f32 r = degrees * 3.14159265f / 180.0f;
-	const f32 c = cosf(r), s = sinf(r);
-	const f32 dx[4] = { -w / 2, w / 2, w / 2, -w / 2 };
-	const f32 dy[4] = { -h / 2, -h / 2, h / 2, h / 2 };
-	for (int i = 0; i < 4; i++) {
-		out[i][0] = cx + dx[i] * c + dy[i] * s;
-		out[i][1] = cy - dx[i] * s + dy[i] * c;
-	}
-}
-
-void setupTextured()
-{
-	GXSetNumChans(1);
-	GXSetNumTevStages(1);
-	GXSetNumTexGens(1);
-	GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-	GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
-	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
-	GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_SET);
-	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-	GXClearVtxDesc();
-	GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
-	GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-	GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
-}
-
-void quad(f32 cx, f32 cy, f32 w, f32 h, f32 degrees, u32 colour, u8 alpha, bool textured)
-{
-	f32 at[4][2];
-	corners(cx, cy, w, h, degrees, at);
-	static const f32 kU[4] = { 0, 1, 1, 0 }, kV[4] = { 0, 0, 1, 1 };
-	GXColor c;
-	colourOf(colour, alpha, &c);
-	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
-	for (int i = 0; i < 4; i++) {
-		GXPosition3f32(at[i][0], at[i][1], 0.0f);
-		GXColor4u8(c.r, c.g, c.b, c.a);
-		if (textured)
-			GXTexCoord2f32(kU[i], kV[i]);
-	}
-	GXEnd();
-}
-
-void fill(f32 cx, f32 cy, f32 w, f32 h, f32 degrees, u32 colour, u8 alpha)
-{
-	GXSetNumChans(1);
-	GXSetNumTevStages(1);
-	GXSetNumTexGens(0);
-	GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
-	GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
-	GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_SET);
-	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-	GXClearVtxDesc();
-	GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
-	GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-	quad(cx, cy, w, h, degrees, colour, alpha, false);
-}
-
-void art(JUTTexture& tex, f32 cx, f32 cy, f32 w, f32 h, f32 degrees, u32 colour, u8 alpha)
-{
-	tex.load(GX_TEXMAP0);
-	setupTextured();
-	quad(cx, cy, w, h, degrees, colour, alpha, true);
-}
-
-// An icon of height h with its left edge at x, centred on y; its width.
-f32 icon(JUTTexture& tex, f32 x, f32 y, f32 h, u8 alpha)
-{
-	const ResTIMG* t = tex.getTexInfo();
-	const f32 w = t ? h * t->width / t->height : h;
-	art(tex, x + w / 2, y, w, h, 0.0f, kWhite, alpha);
-	return w;
-}
-
-// "x12" in the HUD's counter digits, its left edge at x and centred on y; its width.
-f32 count(int value, f32 x, f32 y, f32 h, u8 alpha)
-{
-	char text[16];
-	snprintf(text, sizeof text, "%d", value < 0 ? 0 : value);
-	const f32 step = h * 0.86f;
-	art(sCross, x + h / 2, y, h, h, 0.0f, kWhite, alpha);
-	x += step;
-	for (const char* p = text; *p; p++, x += step)
-		art(sDigit[*p - '0'], x + h / 2, y, h, h, 0.0f, kWhite, alpha);
-	return step * (1 + strlen(text));
-}
-
-f32 textWidth(const char* text, f32 size)
-{
-	JUTFont* font = gpSystemFont;
-	f32 w = 0.0f;
-	for (; *text; text++)
-		w += font->getWidth((u8)*text) * (size / font->getWidth());
-	return w;
-}
-
-// Text with its top at y, in the system font, with the game's drop shadow.
-f32 text(const char* s, f32 x, f32 y, f32 size, u32 colour, int align, u8 alpha)
-{
-	JUTFont* font = gpSystemFont;
-	const f32 w = textWidth(s, size);
-	if (align == CENTRE)
-		x -= w / 2;
-	else if (align == RIGHT)
-		x -= w;
-	const f32 baseline = y + size;
-	font->setGX();
-	font->setCharColor(JUtility::TColor(0, 0, 0, alpha / 2));
-	font->drawString_size_scale(x + size * 0.09f, baseline + size * 0.09f, size, size, s, strlen(s), false);
-	GXColor c;
-	colourOf(colour, alpha, &c);
-	font->setCharColor(JUtility::TColor(c.r, c.g, c.b, c.a));
-	font->drawString_size_scale(x, baseline, size, size, s, strlen(s), false);
-	return w;
-}
 
 // A state's picture with a photo border, tilted, with its shadow.
 void picture(int index, int slot, f32 cx, f32 cy, f32 w, f32 degrees, bool front, u8 alpha)
@@ -272,7 +129,6 @@ f32 worldName(const PortSaveStateInfo* st, bool banner, f32 x, f32 y, f32 h, int
 	return shown;
 }
 
-void sound(u32 id) { SMSGetMSound()->startSoundSystemSE(id, 0, nullptr, 0); }
 
 void selectState(int index)
 {
@@ -304,7 +160,7 @@ void drawRow(int index, f32 y, u8 alpha)
 	const bool selected = index == sSelected;
 	// the selected row breathes as the pause menu's options do
 	const f32 pulse = selected ? 1.0f + 0.025f * sinf(sTicks * port_frame_scale() * 0.2f) : 1.0f;
-	art(sBrush, kListX + kRowW / 2, y + 23.0f, kRowW * pulse, 58.0f * pulse, 0.0f,
+	art(sArt.brush, kListX + kRowW / 2, y + 23.0f, kRowW * pulse, 58.0f * pulse, 0.0f,
 	    selected ? kSelectedRow : kOtherRow, (u8)(alpha * (selected ? 0.95f : 0.72f)));
 	// the world's name in the file select's lettering, else in the font
 	if (worldName(st, false, kListX + 20.0f, y + 9.0f, selected ? 17.0f : 15.0f, LEFT, alpha) == 0.0f)
@@ -313,15 +169,15 @@ void drawRow(int index, f32 y, u8 alpha)
 	text(st->when, kListX + 20.0f, y + 21.0f, 9.5f, kPale, LEFT, alpha);
 	if (st->hasCounts) {
 		f32 x = kListX + kRowW - 128.0f;
-		x += icon(sShine, x, y + 25.0f, 17.0f, alpha) + 1.0f;
-		x += count(st->shines, x, y + 26.0f, 13.0f, alpha) + 9.0f;
-		x += icon(sBlueCoin, x, y + 25.0f, 17.0f, alpha) + 1.0f;
-		count(st->blueCoins, x, y + 26.0f, 13.0f, alpha);
+		x += icon(sArt.shine, x, y + 25.0f, 17.0f, alpha) + 1.0f;
+		x += count(sArt, st->shines, x, y + 26.0f, 13.0f, alpha) + 9.0f;
+		x += icon(sArt.blueCoin, x, y + 25.0f, 17.0f, alpha) + 1.0f;
+		count(sArt, st->blueCoins, x, y + 26.0f, 13.0f, alpha);
 	}
 	// the glove's finger points up in its texture: turned clockwise, it points
 	// right, at the row
 	if (selected)
-		art(sCursor, kListX - 2.0f, y + 18.0f, 24.0f * 32 / 46, 24.0f, -90.0f, kWhite, alpha);
+		art(sArt.cursor, kListX - 2.0f, y + 18.0f, 24.0f * 32 / 46, 24.0f, -90.0f, kWhite, alpha);
 }
 
 } // namespace
@@ -332,14 +188,7 @@ void SaveStateMenuOpen()
 {
 	if (sOpen)
 		return;
-	sHaveArt = loadArt(sBrush, "coin_back") && loadArt(sShine, "shine_icon") && loadArt(sBlueCoin, "bluecoin_icon")
-	           && loadArt(sCoin, "coin_icon") && loadArt(sLife, "mario_icon") && loadArt(sCursor, "cursor")
-	           && loadArt(sCross, "coin_number_x");
-	for (int i = 0; i < 10 && sHaveArt; i++) {
-		char name[24];
-		snprintf(name, sizeof name, "coin_number_%d", i);
-		sHaveArt = loadArt(sDigit[i], name);
-	}
+	sHaveArt = loadArt(sArt);
 	if (!sHaveArt)
 		return;
 	sCount       = port_savestate_scan();
@@ -484,10 +333,10 @@ void SaveStateMenuDraw(const JDrama::TRect& screen)
 			text(st->episodeName, kPictureX, 332.0f, 12.5f, kWhite, CENTRE, alpha);
 		if (st->hasCounts) {
 			f32 cx = kPictureX - 86.0f;
-			cx += icon(sCoin, cx, 362.0f, 20.0f, alpha) + 2.0f;
-			cx += count(st->coins, cx, 363.0f, 16.0f, alpha) + 22.0f;
-			cx += icon(sLife, cx, 362.0f, 20.0f, alpha) + 2.0f;
-			count(st->lives, cx, 363.0f, 16.0f, alpha);
+			cx += icon(sArt.coin, cx, 362.0f, 20.0f, alpha) + 2.0f;
+			cx += count(sArt, st->coins, cx, 363.0f, 16.0f, alpha) + 22.0f;
+			cx += icon(sArt.life, cx, 362.0f, 20.0f, alpha) + 2.0f;
+			count(sArt, st->lives, cx, 363.0f, 16.0f, alpha);
 		}
 		char position[24];
 		snprintf(position, sizeof position, "%d of %d", sSelected + 1, sCount);

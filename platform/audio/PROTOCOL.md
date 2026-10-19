@@ -40,7 +40,7 @@ A frame therefore runs: `0x82` → release (CPU has just run `TDSPChannel::updat
 ## Output path
 
 `Kernel::vframeWork` (on each AI DMA interrupt) takes the DSP's finished buffer and interleaves it with `Calc::imixcopy(outB-half, outA-half, dac)`, so DMA pairs are (outB, outA).
-It then adds CPU-mixed extras through `extMixCallback` and hands the block to `AIInitDMA`.
+It then adds CPU-mixed extras through `extMixCallback` (THP movie audio, which `audio-05` scales by the music volume) and hands the block to `AIInitDMA`.
 The DMA callback (`syncAudio`) is the whole audio clock: each block's start wakes the audio thread (message 0 → `Kernel::updateDac`).
 
 ## Voice block (`DSPInterface::DSPBuffer`, 0x180 bytes × 64)
@@ -53,6 +53,7 @@ Fields the DSP writes back are marked ←.
 | 0x000 | `enabled` | set by `playStart`, cleared by the CPU (`replyFinishRequest`, `stop`) |
 | 0x002 | `done` ← | the voice has finished: one-shot end, or stop request completed. `TDSPChannel::updateAll` then calls back and clears `done`/`enabled` |
 | 0x004 | `resamplingRatio` | Q12 step (0x1000 = one source sample per output sample); `4096 × pitch × waveRate / 32028.5`, capped 0x7FFF. Streams use `(rate << 12) / 32000` |
+| 0x006 | (port) volume class | not a DSP field: padding that `TChannel::playLogicalChannel` writes (`decomp-patches/audio-05`) when it starts the voice; 1 = a BGM sequence's voice (follows Music Volume), 0 = anything else (SFX Volume). Streams (source 0x21) are music whatever it says. README.md, Music and SFX volume |
 | 0x008 | `resetVpb` | set by `playStart`: restart decoding (the DSP clears it) |
 | 0x00A | `endReached` ← | set with `done` at a one-shot's end |
 | 0x00C | `useConstantSample` | pause flag: no output, no advance |

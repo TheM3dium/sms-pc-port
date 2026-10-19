@@ -9,6 +9,10 @@ extern "C" {
 extern int port_frame_rate;
 extern int port_active_frame_rate;
 extern int port_high_fps_active;
+// 2 when the retrace clock runs at 119.88 Hz, else 1. Fixed at start from the frame rate then
+// (platform/port_runtime.cpp): the clock cannot be re-timed while the game runs, so the settings
+// menu may change port_frame_rate for the next area without moving it.
+extern int port_vi_multiplier;
 }
 
 // Configuration is independent of GPU performance and monitor refresh rate.
@@ -21,7 +25,7 @@ static inline int port_parse_frame_rate(const char* value)
 
 static inline int port_vi_retrace_multiplier()
 {
-    return port_frame_rate == 120 ? 2 : 1;
+    return port_vi_multiplier;
 }
 
 static inline int port_native_frame_divisor()

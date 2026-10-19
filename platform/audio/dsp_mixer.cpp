@@ -5,6 +5,7 @@
 // and for what is approximated.
 #include "dsp_mixer.h"
 
+#include <atomic>
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -29,7 +30,8 @@ struct Voice {
 	uint16_t enabled;          // 0x000
 	uint16_t done;             // 0x002 DSP sets when the voice has finished
 	uint16_t ratio;            // 0x004 Q12 resampling ratio (0x1000 = 1:1)
-	uint16_t pad006;           // 0x006
+	uint8_t volumeClass;       // 0x006 port tag, not the DSP's: PORT_DSPMIX_CLASS_* (written by TChannel::playLogicalChannel)
+	uint8_t pad007;            // 0x007
 	uint16_t resetVpb;         // 0x008 set by playStart: (re)start decoding
 	uint16_t endReached;       // 0x00A DSP sets at the end of a one-shot wave
 	uint16_t pause;            // 0x00C useConstantSample (setPauseFlag)
@@ -135,6 +137,14 @@ int bus_index(uint16_t addr)
 	return 0;
 }
 
+// Per-class gains (percent): the settings menu changes them on the game's thread, the mixer reads
+// them once per subframe. A class starts at 100, which leaves its samples untouched.
+const int kUnityGain = 32768; // Q15
+struct ClassPercent {
+	std::atomic<int> percent;
+	constexpr ClassPercent() : percent(100) { }
+} gClassPercent[PORT_DSPMIX_CLASSES];
+
 struct Decoder {
 	bool active;
 	bool ended;       // one-shot source ran out
@@ -167,6 +177,9 @@ struct State {
 	uint32_t fxPos[4];
 	int32_t fxHist[4][8];
 	int active;
+	int gainFrom[PORT_DSPMIX_CLASSES]; // Q15: each class's gain at the start and the end of this subframe
+	int gainTo[PORT_DSPMIX_CLASSES];
+	bool gainSeen;                      // gainTo holds the last subframe's gain
 	int masterShift; // master level fixed point: Q15 (measured against retail, PROTOCOL.md)
 	int slotShift;   // mixChannels volume fixed point: Q14
 	bool fxOff;
@@ -209,6 +222,40 @@ void load_adpcm_table(const uint32_t* t)
 }
 
 inline int32_t sat16(int32_t v) { return v < -32768 ? -32768 : v > 32767 ? 32767 : v; }
+
+// What a voice's volume follows: the music setting for a stream (direct PCM) and for a voice a BGM
+// sequence started (the game's tag), the SFX setting for the rest.
+int voice_class(const Voice& v)
+{
+	return v.sourceType == kDirectPcm || v.volumeClass == PORT_DSPMIX_CLASS_MUSIC ? PORT_DSPMIX_CLASS_MUSIC
+	                                                                           : PORT_DSPMIX_CLASS_SFX;
+}
+
+// The gains for this subframe: the settings' values now, ramped to from the last subframe's, so a
+// change made while a sound plays does not click.
+void begin_class_gains()
+{
+	for (int c = 0; c < PORT_DSPMIX_CLASSES; c++) {
+		const int to = port_dspmix_class_gain(c);
+		g.gainFrom[c] = g.gainSeen ? g.gainTo[c] : to;
+		g.gainTo[c]   = to;
+	}
+	g.gainSeen = true;
+}
+
+// Scale a voice's source samples by its class's gain before they go to any send, so its dry level
+// and its FX sends (the reverb it feeds) follow the setting together.
+void apply_class_gain(const Voice& v, int32_t* src, int n)
+{
+	const int c = voice_class(v);
+	const int32_t from = g.gainFrom[c], to = g.gainTo[c];
+	if (from == kUnityGain && to == kUnityGain)
+		return;
+	for (int k = 0; k < n; k++) {
+		const int32_t gain = from + (to - from) * (k + 1) / n;
+		src[k]             = (int32_t)(((int64_t)src[k] * gain) >> 15);
+	}
+}
 
 const uint8_t* aram(uint32_t addr) { return g.aram ? g.aram(addr) : NULL; }
 
@@ -416,10 +463,11 @@ void render_voice(int vi, int n)
 		if (g.trace)
 			fprintf(stderr,
 			        "[audio] voice %2d start: src %2u base 0x%06x ratio 0x%04x loop %u [%u,%u) n %d vol "
-			        "%04x/%04x/%04x/%04x bus %03x/%03x/%03x/%03x am %u\n",
+			        "%04x/%04x/%04x/%04x bus %03x/%03x/%03x/%03x am %u %s\n",
 			        vi, v.sourceType, v.base, v.ratio, v.looping, v.loopStart, v.endPosition, v.sampleCount,
 			        v.slot[0].target, v.slot[1].target, v.slot[2].target, v.slot[3].target, v.slot[0].bus,
-			        v.slot[1].bus, v.slot[2].bus, v.slot[3].bus, v.amEnabled);
+			        v.slot[1].bus, v.slot[2].bus, v.slot[3].bus, v.amEnabled,
+			        voice_class(v) == PORT_DSPMIX_CLASS_MUSIC ? "music" : "sfx");
 	}
 	bool stopping = v.endRequested != 0;
 	if (!supported(v.sourceType)) {
@@ -450,6 +498,7 @@ void render_voice(int vi, int n)
 	} else {
 		got = resample(d, v, src, n);
 	}
+	apply_class_gain(v, src, n);
 	g.active++;
 
 	if (v.amEnabled) {
@@ -627,6 +676,19 @@ extern "C" void port_dspmix_setup(uint32_t nvoices, void* voices, const uint32_t
 extern "C" void port_dspmix_set_aram(port_dspmix_aram_fn fn) { g.aram = fn; }
 extern "C" void port_dspmix_set_mram(port_dspmix_mram_fn fn) { g.mram = fn; }
 
+extern "C" void port_dspmix_set_class_percent(int cls, int percent)
+{
+	if (cls >= 0 && cls < PORT_DSPMIX_CLASSES)
+		gClassPercent[cls].percent.store(percent < 0 ? 0 : percent > 100 ? 100 : percent, std::memory_order_relaxed);
+}
+
+extern "C" int port_dspmix_class_percent(int cls)
+{
+	return cls >= 0 && cls < PORT_DSPMIX_CLASSES ? gClassPercent[cls].percent.load(std::memory_order_relaxed) : 100;
+}
+
+extern "C" int port_dspmix_class_gain(int cls) { return (int)((int64_t)port_dspmix_class_percent(cls) * kUnityGain / 100); }
+
 extern "C" void port_dspmix_render(int16_t* outA, int16_t* outB, int n, uint16_t master)
 {
 	if (n > kMaxN)
@@ -634,6 +696,7 @@ extern "C" void port_dspmix_render(int16_t* outA, int16_t* outB, int n, uint16_t
 	for (int b = 0; b < kBuses; b++)
 		memset(g.bus[b], 0, sizeof(int32_t) * n);
 	g.active = 0;
+	begin_class_gains();
 	prepare_fx(n);
 	if (g.voices) {
 		for (uint32_t i = 0; i < g.nvoices; i++) {

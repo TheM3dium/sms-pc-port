@@ -143,6 +143,10 @@ static std::unordered_map<std::string, PackFile>& s_index =
     *new std::unordered_map<std::string, PackFile>;  // key: the texture name (read by the worker; never destroyed)
 static std::atomic<int> s_state{-1};                       // published after the index and GL formats are ready
 static uint32_t s_uploaded = 0;                            // replacements in GL
+// The settings menu's HD Textures off (hiresSetActive): the index and the names the texture cache
+// gave its entries stay, and only what answers draws and asks for textures stops, so turning the
+// textures on again shows each replacement that was ready at once and reads the rest as drawn.
+static std::atomic<bool> s_off{false};
 
 static bool endsWith(const std::string& s, const char* suf) {
     size_t n = strlen(suf);
@@ -558,15 +562,17 @@ static void requestTexture(const std::string& name, uint32_t w, uint32_t h, int 
 // "Prefetch Custom Textures" does: the UHD pack takes about 4 GB of video
 // memory); 0 reads each texture when it is first drawn, showing the original
 // until it is ready.
-static int preloadMode() {
-    static const int mode = [] {
+static std::atomic<int> s_mode{-1};  // 0, 1 or 2: the variable's, then the settings menu's; -1 not read yet
+static int configuredMode() {
+    int mode = s_mode.load();
+    if (mode < 0) {
         const char* e = getenv("SMS_TEXTURE_PACK_PRELOAD");
-        if (!e || !*e) return 1;
-        if (!strcmp(e, "all")) return 2;
-        return atoi(e) != 0 || !strcmp(e, "on") ? 1 : 0;
-    }();
-    return syncLoading() ? 0 : mode;
+        mode = !e || !*e ? 1 : !strcmp(e, "all") ? 2 : (atoi(e) != 0 || !strcmp(e, "on")) ? 1 : 0;
+        s_mode = mode;
+    }
+    return mode;
 }
+static int preloadMode() { return syncLoading() ? 0 : configuredMode(); }
 static bool preloading() { return preloadMode() != 0; }
 
 // The levels a pack leaves out are made at the lowest priority, of processor
@@ -631,7 +637,7 @@ static void prefetchTimg(const uint8_t* data, size_t size, size_t off) {
 
 void hiresPrefetchResource(const void* ptr, uint32_t size, const char* name) {
     // Never scan directories or query GL on a resource-loading thread.
-    if (s_state != 1 || !preloading() || !ptr || size < 0x20) return;
+    if (s_state != 1 || s_off || !preloading() || !ptr || size < 0x20) return;
     const uint8_t* data = static_cast<const uint8_t*>(ptr);
     bool model = !memcmp(data, "J3D2", 4), particle = !memcmp(data, "JEFFjpa1", 8);
     if (!model && !particle) {
@@ -1150,6 +1156,7 @@ static void worker() {
             std::lock_guard<std::mutex> lk(s_mu);
             (req.kind == DEMAND ? s_busy : s_busyPack) = false;
             if (s_stop) return;
+            if (req.kind == PACK && s_mode.load() != 2) req.kind = DEMAND;  // read as "all" ended (dropPack)
             s_decodedBytes += bytes;
             if (req.kind == DEMAND) s_decodedDemand++;
             if (req.kind == PACK) {
@@ -1209,6 +1216,25 @@ static void requestPack() {
         unsigned w = 0, h = 0;
         if (sscanf(kv.first.c_str(), "tex1_%ux%u", &w, &h) == 2 && w && h) requestTexture(kv.first, w, h, PACK);
     }
+}
+
+// Leaving "all" (the settings menu): the pack's textures not yet read are forgotten, so a draw asks
+// for its own as usual, and the ones read already are sent like any other, since nothing but a load
+// in "all" takes them as the pack's.
+static void dropPack() {
+    std::lock_guard<std::mutex> lk(s_mu);
+    for (const Request& r : s_packQueue)
+        if (s_packPending.count(r.name)) s_requested.erase(r.name);
+    s_packQueue.clear();
+    s_packPending.clear();
+    for (Decoded& d : s_decoded)
+        if (d.request.kind == PACK) {
+            d.request.kind = DEMAND;
+            s_decodedDemand++;
+            s_decodedPack--;
+            s_decodedPackBytes -= d.bytes;
+        }
+    s_cv.notify_all();
 }
 
 // The completion worker makes the compressed levels a replacement's file
@@ -1384,6 +1410,7 @@ static void finishUpload(Upload& u, int unit) {
 // request/look up replacements; uploads happen at frame boundaries/loading.
 // SMS_TEXTURE_PACK_SYNC=1 decodes on the spot (repeatable captures).
 GLuint hiresTexture(const std::string& name, int unit, uint32_t gxW, uint32_t gxH, int* scale) {
+    if (s_off) return 0;
     auto it = s_repl.find(name);
     if (it == s_repl.end()) {
         s_repl[name];
@@ -1563,7 +1590,7 @@ static void touchFresh() {
 }
 
 void hiresPreload() {
-    if (s_state != 1 || !preloading()) return;
+    if (s_state != 1 || s_off || !preloading()) return;
     const auto start = std::chrono::steady_clock::now();
     uint32_t before = s_uploaded;
     uploadPending(true);
@@ -1666,6 +1693,24 @@ void hiresShutdown() {
 }
 
 uint32_t hiresUploadedCount() { return s_uploaded; }
+
+// The settings menu (gx_settings_extra.cpp). Active is whether the pack's replacements are shown;
+// the pack is found at the start (a game started with textures off has none: hiresEnabled is false).
+bool hiresActive() { return !s_off; }
+void hiresSetActive(bool on) { s_off = !on; }
+
+// 0 reads each texture as drawn, 1 prepares what a stage's resources name while it loads, 2 reads
+// and keeps the whole pack too.
+int hiresLoadMode() { return configuredMode(); }
+void hiresSetLoadMode(int mode) {
+    mode = mode >= 2 ? 2 : mode <= 0 ? 0 : 1;
+    const int was = configuredMode();
+    if (mode == was) return;
+    s_mode = mode;
+    if (s_state != 1) return;
+    if (mode == 2) requestPack();
+    else if (was == 2) dropPack();
+}
 
 HiresStats hiresStats() {
     std::lock_guard<std::mutex> lk(s_mu);

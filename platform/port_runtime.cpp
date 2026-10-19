@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <signal.h>
+#include "port_settings.h"
 #include <execinfo.h>
 #include "port_host.h"
 #include "disc/gcdisc.h"
@@ -90,6 +91,9 @@ extern "C" int port_active_frame_rate;
 int port_active_frame_rate = 30;
 extern "C" int port_high_fps_active;
 int port_high_fps_active = 0;
+// The retrace clock's rate, latched from port_frame_rate in port_init (see port_framerate.h).
+extern "C" int port_vi_multiplier;
+int port_vi_multiplier = 1;
 
 // "16:9", "21:9", "16:10", "on" (16:9), "off"/"0", or a ratio such as 1.85.
 static float parse_widescreen(const char* v)
@@ -849,6 +853,8 @@ static const struct {
 	{ "hdr_copy", "SMS_HDR_COPY" }, // 1: frames reach Direct3D through system memory, not a shared texture
 	{ "audio", "SMS_AUDIO" },
 	{ "volume", "SMS_VOLUME" }, // master volume, 0 to 100
+	{ "music_volume", "SMS_MUSIC_VOLUME" }, // music (the BGM sequences, streams and movies), 0 to 100
+	{ "sfx_volume", "SMS_SFX_VOLUME" },     // sound effects and everything else the game's sound system plays, 0 to 100
 	{ "soft_trigger", "SMS_SOFT_TRIGGER" }, // L_SOFT / R_SOFT press depth, percent
 	{ "overlay", "SMS_OVERLAY" },
 	{ "save_dir", "SMS_SAVE_DIR" },
@@ -959,6 +965,7 @@ extern "C" void port_init(int argc, char** argv)
 	if (frame_rate && strcmp(frame_rate, "30") && strcmp(frame_rate, "60") && strcmp(frame_rate, "120"))
 		port_log("[port] unsupported frame rate '%s'; using 60\n", frame_rate);
 	port_log("[port] frame rate: %d during gameplay\n", port_frame_rate);
+	port_vi_multiplier = port_frame_rate == 120 ? 2 : 1;
 	sms_mod_activate();
 	for (int i = 1; i < argc; i++)
 		if (strcmp(argv[i], "--headless") == 0) {
@@ -987,4 +994,69 @@ extern "C" void port_init(int argc, char** argv)
 	port_noaudio_init();
 	port_vi_init();
 	port_log("[port] platform ready\n");
+}
+
+// --- Settings menu (port_settings.h) ---
+// All three options are plain ints that the game thread reads and the menu (also the game's thread,
+// while it is paused) writes.
+namespace {
+
+int off_on_count() { return 2; }
+const char* off_on_name(int i) { return i ? "On" : "Off"; }
+
+// The THPPlayer patch (0016) tests port_skip_movies each time a movie is prepared or played, so a
+// change counts from the next movie.
+int skip_movies_get() { return port_skip_movies != 0; }
+int skip_movies_set(int v) { port_skip_movies = v != 0; return 1; }
+
+// TShimmer::perform (zzz-heat-haze-01) tests port_heat_haze every frame.
+int heat_haze_get() { return port_heat_haze != 0; }
+int heat_haze_set(int v) { port_heat_haze = v != 0; return 1; }
+
+// The game reads port_frame_rate only when a director starts (portSetGameplayFrameRate, in the
+// Application patches framerate-01 and framerate-18): the next area gets the new rate and the one in
+// progress keeps its own, which its frame-counted timers need. The retrace clock cannot change rate
+// while the game runs (port_vi_multiplier, latched in port_init), so 120 is offered only when the
+// game started at 120; 30 and 60 are always possible, from either clock.
+const int kFrameRates[] = { 30, 60, 120 };
+
+int frame_rate_count() { return port_vi_multiplier == 2 ? 3 : 2; }
+const char* frame_rate_name(int i)
+{
+	static const char* const names[] = { "30", "60", "120" };
+	return names[i < 0 ? 0 : i > 2 ? 2 : i];
+}
+int frame_rate_get()
+{
+	for (int i = 0; i < 3; i++)
+		if (port_frame_rate == kFrameRates[i])
+			return i;
+	return 1;
+}
+int frame_rate_set(int i)
+{
+	if (i < 0 || i >= frame_rate_count())
+		return 0;
+	port_frame_rate = kFrameRates[i];
+	return 1;
+}
+
+const PortSetting kRuntimeSettings[] = {
+	{ "skipMovies", PORT_SETTINGS_PAGE_GAMEPLAY, 20, "Skip Cutscenes",
+	  "Skips story movies. Movies playing in the world, like the plaza's, still play.", 0, NULL, off_on_count,
+	  off_on_name, skip_movies_get, skip_movies_set },
+	{ "frameRate", PORT_SETTINGS_PAGE_DISPLAY, 80, "Frame Rate",
+	  "Gameplay frames per second, from the next area. 120 only if started at 120.", 1, NULL, frame_rate_count,
+	  frame_rate_name, frame_rate_get, frame_rate_set },
+	{ "heatHaze", PORT_SETTINGS_PAGE_GRAPHICS, 90, "Heat-Wave Effect",
+	  "The shimmer over hot, sunny areas. Off clears the picture and saves a little.", 0, NULL, off_on_count,
+	  off_on_name, heat_haze_get, heat_haze_set },
+};
+
+} // namespace
+
+extern "C" const PortSetting* port_runtime_settings(int* count)
+{
+	*count = (int)(sizeof kRuntimeSettings / sizeof kRuntimeSettings[0]);
+	return kRuntimeSettings;
 }

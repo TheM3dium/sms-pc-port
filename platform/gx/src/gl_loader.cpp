@@ -317,6 +317,7 @@ void gx::glt::installProxies() {
     gx_glDeleteFramebuffers = &deleteNames<&real_glDeleteFramebuffers>;
     gx_glDeleteQueries = &deleteNames<&real_glDeleteQueries>;
     gx_glDeleteSamplers = &deleteNames<&real_glDeleteSamplers>;
+    gx_glDeleteRenderbuffers = &deleteNames<&real_glDeleteRenderbuffers>;
     gx_glDeleteVertexArrays = &deleteNames<&real_glDeleteVertexArrays>;
     gx_glBindBuffer = &pxBindBuffer;
     gx_glPixelStorei = &pxPixelStorei;
