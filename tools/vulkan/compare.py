@@ -135,7 +135,7 @@ WINDOW = False
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('runs', nargs='+')
-    ap.add_argument('--exe', default=os.path.join(ROOT, 'build', 'linux-64', 'sms'))
+    ap.add_argument('--exe', default=os.path.join(ROOT, 'build', 'macos-64' if sys.platform == 'darwin' else 'linux-64', 'sms'))
     ap.add_argument('--disc', default=None)
     ap.add_argument('--work', default=None, help='folder for the runs (default: a temporary one)')
     ap.add_argument('--out', default=None, help='write comparison images here')
@@ -145,6 +145,7 @@ def main():
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for both runs')
     ap.add_argument('--window', action='store_true', help='run in a window instead of headless (macOS)')
     args = ap.parse_args()
+    args.exe = os.path.abspath(args.exe)
     global WINDOW
     WINDOW = args.window
     for kv in args.env:

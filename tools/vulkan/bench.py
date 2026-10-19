@@ -85,7 +85,7 @@ def summarize(windows):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--exe', default=os.path.join(ROOT, 'build', 'linux-64', 'sms'))
+    ap.add_argument('--exe', default=os.path.join(ROOT, 'build', 'macos-64' if sys.platform == 'darwin' else 'linux-64', 'sms'))
     ap.add_argument('--disc', default=None)
     ap.add_argument('--rounds', type=int, default=2)
     ap.add_argument('--scale', type=float, default=1.0, help='internal resolution (SMS_GX_SCALE)')
@@ -97,6 +97,7 @@ def main():
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for both backends')
     ap.add_argument('--work', default=None)
     args = ap.parse_args()
+    args.exe = os.path.abspath(args.exe)
     disc = args.disc or compare.regress.find_disc()
     if not disc:
         sys.exit('no disc image: pass --disc')
