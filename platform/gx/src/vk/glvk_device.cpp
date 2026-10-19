@@ -6,8 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <algorithm>
+#include <chrono>
 #include <deque>
 
 #ifdef SMS_GX_HAVE_SDL2
@@ -30,9 +30,7 @@ Ring g_staging, g_dynamic;
 Stats g_stats;
 
 double now() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 Image* g_backbuffer = nullptr;
 
