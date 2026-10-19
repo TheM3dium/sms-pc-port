@@ -694,7 +694,11 @@ static void programCacheLoad() {
     } else {
         std::string base = userCacheDir();
         if (base.empty()) return;
-        s_cachePath = base + (sizeof(void*) == 8 ? "/gx-programs-64.bin" : "/gx-programs-32.bin");
+        // the Vulkan backend's programs (glvk, SPIR-V) in a file of their own,
+        // so switching backends does not start either cache over
+        const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+        const bool vk = vendor && !strcmp(vendor, "glvk");
+        s_cachePath = base + (vk ? "/gx-programs-vk-" : "/gx-programs-") + (sizeof(void*) == 8 ? "64.bin" : "32.bin");
     }
     const uint64_t driver = driverId();
     unsigned loaded = 0, stale = 0;

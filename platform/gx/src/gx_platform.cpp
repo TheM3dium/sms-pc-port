@@ -46,6 +46,12 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #endif
+#ifdef SMS_GX_HAVE_VULKAN
+#include "vk/glvk.h"
+#ifdef SMS_GX_HAVE_SDL2
+#include <SDL_vulkan.h>
+#endif
+#endif
 
 // USB ids of the GameCube adapters the PAD layer reads itself, which SDL must
 // leave alone (platform/pad/gc_adapter.cpp); none without it.
@@ -74,6 +80,29 @@ const double kSkipPresentCost = 0.002;
 double s_lastPresent = 0;  // the last display copy's present, 0 when skipped
 int s_vsync = 0;
 uint32_t s_frame = 0;
+// SMS_GX_BACKEND=vulkan (or --vulkan): the renderer's GL calls go to glvk
+// (src/vk), on Vulkan; when Vulkan cannot start, OpenGL as usual.
+int s_wantVulkan = -1;  // -1: from the environment
+bool s_vulkan = false;  // the backend in use is Vulkan
+bool wantVulkan() {
+    if (s_wantVulkan < 0) {
+        const char* e = getenv("SMS_GX_BACKEND");
+        s_wantVulkan = e && (!strcmp(e, "vulkan") || !strcmp(e, "vk"));
+    }
+#ifdef SMS_GX_HAVE_VULKAN
+    return s_wantVulkan == 1;
+#else
+    static bool told = false;
+    if (s_wantVulkan == 1 && !told) {
+        told = true;
+        gx::logmsg("Vulkan was asked for, but this build has no Vulkan backend; OpenGL instead");
+    }
+    return false;
+#endif
+}
+#ifdef SMS_GX_HAVE_VULKAN
+void* vkGetProc(const char* name) { return glvk::getProc(name); }
+#endif
 
 #ifdef SMS_GX_HAVE_SDL2
 SDL_Window* s_window = nullptr;
@@ -328,7 +357,7 @@ static float fsrScale(float scale, float outW, float outH) {
     return s;
 }
 
-bool openWindow(float scale) {
+bool openWindow(float scale, bool vulkan) {
 #ifdef SDL_HINT_WINDOWS_DPI_SCALING
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
 #endif
@@ -358,10 +387,12 @@ bool openWindow(float scale) {
     if (const char* d = SDL_GetCurrentVideoDriver()) snprintf(s_videoDriver, sizeof s_videoDriver, "%s", d);
     // from here on a display exists: a failure is the window's or the context's
     s_windowFailure = WF_WINDOW;
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    if (!vulkan) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    }
     // Open on the monitor containing the pointer (usually the launcher's Play
     // button). Fall back to the primary display if global coordinates are unavailable.
     SDL_Point pointer = {};
@@ -398,7 +429,7 @@ bool openWindow(float scale) {
         }
     }
     s_window = SDL_CreateWindow("Super Mario Sunshine", layout.x, layout.y, layout.w, layout.h,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+                                (vulkan ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
                                 SDL_WINDOW_HIDDEN);
     if (!s_window) {
         logmsg("SDL_CreateWindow failed (%s): %s", s_videoDriver, SDL_GetError());
@@ -410,8 +441,22 @@ bool openWindow(float scale) {
     static bool atExit = false;
     if (!atExit) atExit = atexit(leaveFullscreenAtExit) == 0;
     applyIcon();
-    s_glctx = SDL_GL_CreateContext(s_window);
-    if (!s_glctx) {
+#ifdef SMS_GX_HAVE_VULKAN
+    if (vulkan) {
+        glvk::InitInfo vi;
+        vi.sdlWindow = s_window;
+        vi.vsync = s_vsync;
+        if (!glvk::init(vi)) {
+            snprintf(s_windowError, sizeof s_windowError, "Vulkan could not start");
+            SDL_DestroyWindow(s_window);
+            s_window = nullptr;
+            SDL_Quit();
+            return false;
+        }
+    }
+#endif
+    if (!vulkan) s_glctx = SDL_GL_CreateContext(s_window);
+    if (!vulkan && !s_glctx) {
         logmsg("OpenGL 3.3 core context failed (%s): %s", s_videoDriver, SDL_GetError());
         snprintf(s_windowError, sizeof s_windowError, "OpenGL 3.3: %s", SDL_GetError());
         SDL_DestroyWindow(s_window);
@@ -419,12 +464,18 @@ bool openWindow(float scale) {
         SDL_Quit();
         return false;
     }
-    SDL_GL_MakeCurrent(s_window, s_glctx);
-    // adaptive vsync (-1) tears only when a frame is late; not every driver has it
-    if (SDL_GL_SetSwapInterval(s_vsync) != 0 && s_vsync < 0) SDL_GL_SetSwapInterval(1);
+    if (!vulkan) {
+        SDL_GL_MakeCurrent(s_window, s_glctx);
+        // adaptive vsync (-1) tears only when a frame is late; not every driver has it
+        if (SDL_GL_SetSwapInterval(s_vsync) != 0 && s_vsync < 0) SDL_GL_SetSwapInterval(1);
+    }
     {  // the picture's size on screen, for FSR 1's modes: the window, or the display it will fill
         int drawW = layout.w, drawH = layout.h;
-        SDL_GL_GetDrawableSize(s_window, &drawW, &drawH);
+#ifdef SMS_GX_HAVE_VULKAN
+        if (vulkan) SDL_Vulkan_GetDrawableSize(s_window, &drawW, &drawH);
+        else
+#endif
+            SDL_GL_GetDrawableSize(s_window, &drawW, &drawH);
         float outW = float(drawW), outH = float(drawH);
         if (envTrue("SMS_FULLSCREEN")) {
             const float dpi = layout.w > 0 ? float(drawW) / float(layout.w) : 1.0f;
@@ -443,9 +494,19 @@ bool openWindow(float scale) {
         }
         scale = fsrScale(scale, outW, outH);
     }
-    if (!GXPC_Init(sdlGetProc, scale)) {
-        snprintf(s_windowError, sizeof s_windowError, "the renderer could not start on this OpenGL context");
-        SDL_GL_DeleteContext(s_glctx);
+    s_vulkan = vulkan;
+#ifdef SMS_GX_HAVE_VULKAN
+    const bool started = GXPC_Init(vulkan ? vkGetProc : sdlGetProc, scale);
+#else
+    const bool started = GXPC_Init(sdlGetProc, scale);
+#endif
+    if (!started) {
+        snprintf(s_windowError, sizeof s_windowError, "the renderer could not start on this %s", vulkan ? "Vulkan device" : "OpenGL context");
+#ifdef SMS_GX_HAVE_VULKAN
+        if (vulkan) glvk::shutdown();
+#endif
+        s_vulkan = false;
+        if (s_glctx) SDL_GL_DeleteContext(s_glctx);
         SDL_DestroyWindow(s_window);
         s_glctx = nullptr;
         s_window = nullptr;
@@ -487,24 +548,32 @@ bool openWindow(float scale) {
     {  // SMS_HDR: present in HDR through Direct3D (gx_hdr.cpp)
         SDL_SysWMinfo wm;
         SDL_VERSION(&wm.version);
-        if (SDL_GetWindowWMInfo(s_window, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS) hdrInit(wm.info.win.window);
+        if (vulkan) {
+            if (getenv("SMS_HDR") && strcmp(getenv("SMS_HDR"), "0") != 0) logmsg("HDR: not with Vulkan yet; the game shows in SDR");
+        } else if (SDL_GetWindowWMInfo(s_window, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS) {
+            hdrInit(wm.info.win.window);
+        }
     }
 #else
-    hdrInit(nullptr);
+    if (!vulkan) hdrInit(nullptr);
 #endif
     if (s_isFullscreen)
-        logmsg("%s fullscreen on display %d (%s), internal resolution scale %g, OpenGL context ready",
+        logmsg("%s fullscreen on display %d (%s), internal resolution scale %g, %s ready",
                (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN) &&
                (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != SDL_WINDOW_FULLSCREEN_DESKTOP ? "exclusive" : "desktop",
-               display, s_videoDriver, scale);
+               display, s_videoDriver, scale, vulkan ? "Vulkan device" : "OpenGL context");
     else
-        logmsg("window %dx%d centered on display %d (%s), internal resolution scale %g, OpenGL context ready",
-               layout.w, layout.h, display, s_videoDriver, scale);
+        logmsg("window %dx%d centered on display %d (%s), internal resolution scale %g, %s ready",
+               layout.w, layout.h, display, s_videoDriver, scale, vulkan ? "Vulkan device" : "OpenGL context");
     s_windowFailure = WF_NONE;
     s_mouseCamera = envTrue("SMS_MOUSE_CAMERA");
     if (s_mouseCamera) {
         logmsg("mouse look on (F10 releases the mouse)");
         captureMouse((SDL_GetWindowFlags(s_window) & SDL_WINDOW_INPUT_FOCUS) != 0);
+    }
+    if (vulkan) {  // glvk moves to the GL thread with nothing to bind
+        if (glt::start([](void*) {}, nullptr)) glt::installProxies();
+        return true;
     }
     // the context moves to the GL thread (gx_glthread.h)
     SDL_GL_MakeCurrent(s_window, nullptr);
@@ -554,7 +623,12 @@ bool openWindowAnyBackend(float scale) {
 #if !defined(_WIN32) && !defined(__APPLE__)
     findDesktop();
 #endif
-    if (openWindow(scale)) return true;
+    if (wantVulkan()) {
+        if (openWindow(scale, true)) return true;
+        if (s_windowFailure != WF_WINDOW) return false;
+        logmsg("Vulkan could not start (%s); OpenGL instead", s_windowError);
+    }
+    if (openWindow(scale, false)) return true;
 #if !defined(_WIN32) && !defined(__APPLE__)
     if (s_windowFailure != WF_WINDOW) return false;
     const char* other = !strcmp(s_videoDriver, "wayland") ? "x11" : !strcmp(s_videoDriver, "x11") ? "wayland" : nullptr;
@@ -562,7 +636,7 @@ bool openWindowAnyBackend(float scale) {
         const std::string first = s_videoDriver, firstError = s_windowError;
         logmsg("no window on %s (%s); trying %s", first.c_str(), firstError.c_str(), other);
         forceVideoDriver(other);
-        if (openWindow(scale)) return true;
+        if (openWindow(scale, false)) return true;
         snprintf(s_windowError, sizeof s_windowError, "%s: %s; %s: %s", first.c_str(), firstError.c_str(), other,
                  std::string(s_windowError).c_str());
         s_windowFailure = WF_WINDOW;
@@ -628,6 +702,22 @@ bool openHeadless(float scale) {
 }
 #endif
 
+#ifdef SMS_GX_HAVE_VULKAN
+bool openHeadlessVulkan(float scale) {
+    glvk::InitInfo vi;
+    vi.vsync = 0;
+    if (!glvk::init(vi)) return false;
+    s_vulkan = true;
+    if (!GXPC_Init(vkGetProc, scale)) {
+        glvk::shutdown();
+        s_vulkan = false;
+        return false;
+    }
+    if (glt::start([](void*) {}, nullptr)) glt::installProxies();
+    return true;
+}
+#endif
+
 void dumpFrame(const void* xfb) {
     static int every = -1;
     static const char* dir = nullptr;
@@ -668,6 +758,14 @@ namespace gx {
 // GXPC_Shutdown: the GL thread ends and the context is current on the
 // calling thread again, so the caller may destroy it.
 void releaseGlThread() {
+#ifdef SMS_GX_HAVE_VULKAN
+    if (s_vulkan) {  // nothing to unbind; the device ends with the renderer
+        glt::stop();
+        glvk::shutdown();
+        s_vulkan = false;
+        return;
+    }
+#endif
     if (!glt::active()) return;
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode == MODE_WINDOW && s_window) {
@@ -704,6 +802,8 @@ int GXPC_ParseArgs(int* argc, char** argv) {
         if (strcmp(a, "--headless") == 0) s_forceHeadless = 1;
         else if (strcmp(a, "--window") == 0) s_forceHeadless = 0;
         else if (strcmp(a, "--vsync") == 0) s_vsync = 1;
+        else if (strcmp(a, "--vulkan") == 0) s_wantVulkan = 1;
+        else if (strcmp(a, "--opengl") == 0) s_wantVulkan = 0;
         else if (strcmp(a, "--display-info") == 0) {  // for the launcher: what Windows reports for each display
             GXPC_PrintDisplayInfo();
             exit(0);
@@ -790,6 +890,16 @@ int GXPC_InitAuto(float efbScale) {
         logmsg("no display (%s), continuing headless", s_windowError);
     }
 #endif
+#ifdef SMS_GX_HAVE_VULKAN
+    if (wantVulkan()) {
+        if (openHeadlessVulkan(efbScale)) {
+            s_mode = MODE_HEADLESS;
+            logmsg("headless Vulkan device ready");
+            return 1;
+        }
+        logmsg("headless: Vulkan could not start; OpenGL instead");
+    }
+#endif
 #ifdef SMS_GX_HAVE_EGL
     if (openHeadless(efbScale)) {
         s_mode = MODE_HEADLESS;
@@ -806,7 +916,11 @@ void GXPC_Present(const void* xfb) {
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode == MODE_WINDOW && s_window) {
         int w = 0, h = 0;
-        SDL_GL_GetDrawableSize(s_window, &w, &h);
+#ifdef SMS_GX_HAVE_VULKAN
+        if (s_vulkan) SDL_Vulkan_GetDrawableSize(s_window, &w, &h);
+        else
+#endif
+            SDL_GL_GetDrawableSize(s_window, &w, &h);
         double t0 = 0, t1 = 0, tSwapped = 0;
         const bool hdr = hdrActive();
         // on the GL thread, after what the frame queued before (the frame's
@@ -820,6 +934,9 @@ void GXPC_Present(const void* xfb) {
                 shown = false;
                 return;
             }
+#ifdef SMS_GX_HAVE_VULKAN
+            if (s_vulkan) glvk::setDefaultFramebufferSize(w, h);
+#endif
             GXPC_PresentXFB(xfb, w, h);
             GXPC_OverlayDraw(w, h);
             cheatMenuRender(w, h);
@@ -830,6 +947,9 @@ void GXPC_Present(const void* xfb) {
             captureWindow(s_frame, w, h);
             t1 = nowSeconds();
             if (hdr) hdrFramePresent(s_vsync != 0);
+#ifdef SMS_GX_HAVE_VULKAN
+            else if (s_vulkan) glvk::present();
+#endif
             else SDL_GL_SwapWindow(s_window);
             tSwapped = nowSeconds();
         });
@@ -851,6 +971,11 @@ void GXPC_Present(const void* xfb) {
     }
 #else
     (void)xfb;
+#endif
+#ifdef SMS_GX_HAVE_VULKAN
+    // headless: no window to show, but the frame's commands are submitted
+    // (with as many frames in flight as a window has), as a GL driver would
+    if (s_mode == MODE_HEADLESS && s_vulkan) glt::post([] { glvk::present(); });
 #endif
 }
 
