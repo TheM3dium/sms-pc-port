@@ -514,8 +514,9 @@ const PortValueList& volume_list()
 
 // Only a run with a real output device has a volume to change; with no device (headless, SMS_AUDIO=0,
 // SMS_AUDIO_OUT=null, a failed open) or SMS_NO_AUDIO the gain is never applied. The music and SFX
-// rows are offered under the same condition.
+// gains are the mixer's, which applies them whatever the output (a WAV recording too).
 int volume_available() { return g.inited && g.enabled && g.sdl; }
+int class_available() { return g.inited && g.enabled; }
 int volume_count() { return volume_list().n; }
 const char* volume_name(int i) { return percent_name(volume_list(), i); }
 int volume_get() { return volume_list().indexOf(volume_percent()); }
@@ -559,10 +560,10 @@ const PortSetting kAudioSettings[] = {
 	{ "volume", PORT_SETTINGS_PAGE_GAMEPLAY, 30, "Volume", "How loud the game is. 0 is silent, 100 is full.", 0, volume_available, volume_count,
 	  volume_name, volume_get, volume_set },
 	{ "musicVolume", PORT_SETTINGS_PAGE_GAMEPLAY, 32, "Music Volume",
-	  "How loud the music is, cutscene movies included. 0 is silent, 100 is full.", 0, volume_available, music_count,
+	  "How loud the music is, cutscene movies included. 0 is silent, 100 is full.", 0, class_available, music_count,
 	  music_name, music_get, music_set },
 	{ "sfxVolume", PORT_SETTINGS_PAGE_GAMEPLAY, 34, "SFX Volume",
-	  "How loud sound effects are, Mario's voice included. 0 is silent, 100 is full.", 0, volume_available, sfx_count,
+	  "How loud sound effects are, Mario's voice included. 0 is silent, 100 is full.", 0, class_available, sfx_count,
 	  sfx_name, sfx_get, sfx_set },
 };
 

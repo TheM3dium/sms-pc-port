@@ -54,6 +54,8 @@ void GXPC_SetWindowIcon(const uint8_t* rgba, int w, int h);
 int GXPC_MouseCaptured(void);
 /* 1 while the cheat menu (F9) is open: the PAD layer reports an idle controller. */
 int GXPC_GameInputBlocked(void);
+// The game's settings menu is open (it has the pad, so the save state keys wait until it closes).
+int GXPC_SettingsMenuIsOpen(void);
 /* The quit key: opens the "are you sure" prompt, whose Quit button exits.
  * 0 without a window (headless), where the caller exits straight away. */
 int GXPC_RequestQuit(void);

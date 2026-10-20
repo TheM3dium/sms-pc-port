@@ -189,7 +189,8 @@ void captureMouse(bool on) {
 // SMS_FULLSCREEN: 1 or desktop (borderless, at the desktop's resolution), or
 // exclusive (the display switches to SMS_FULLSCREEN_MODE=WxH[@Hz], else the
 // desktop's mode). F11 or Alt+Enter toggles between the window and that
-// fullscreen (desktop when SMS_FULLSCREEN is unset).
+// fullscreen (when SMS_FULLSCREEN is unset or 0, SMS_FULLSCREEN_TYPE's:
+// exclusive, else desktop).
 bool s_exclusive = false, s_isFullscreen = false;
 // The size exclusive fullscreen switches the display to (SMS_FULLSCREEN_MODE, or the settings menu's): 0 x 0
 // is the desktop's, and the refresh rate is the desktop's unless SMS_FULLSCREEN_MODE named one.
@@ -646,6 +647,9 @@ bool openWindow(float scale, bool vulkan) {
     // Exclusive fullscreen switches the display to the mode asked for.
     const char* fullscreen = getenv("SMS_FULLSCREEN");
     s_exclusive = fullscreen && strcmp(fullscreen, "exclusive") == 0;
+    // Started in a window: SMS_FULLSCREEN_TYPE=exclusive is the type F11 and the settings menu's Fullscreen go to.
+    if (const char* type = getenv("SMS_FULLSCREEN_TYPE"))
+        if (!envTrue("SMS_FULLSCREEN")) s_exclusive = strcmp(type, "exclusive") == 0;
     if (const char* e = getenv("SMS_FULLSCREEN_MODE")) {
         int w = 0, h = 0, hz = 0;
         if (sscanf(e, "%dx%d@%d", &w, &h, &hz) >= 2 && w > 0 && h > 0) {
@@ -913,6 +917,12 @@ bool platformSetVsync(int mode) {
     s_vsync = mode;
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode != MODE_WINDOW || hdrActive()) return true;  // HDR waits for the display itself (hdrFramePresent)
+#ifdef SMS_GX_HAVE_VULKAN
+    if (s_vulkan) {  // the swap chain is made again with the present mode at the next present
+        glvk::setSwapInterval(mode);
+        return true;
+    }
+#endif
     if (SDL_GL_SetSwapInterval(mode) != 0 && mode < 0) {
         SDL_GL_SetSwapInterval(1);
         s_vsync = 1;
@@ -1028,7 +1038,11 @@ float platformFsrScale(int mode) {
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode != MODE_WINDOW || !s_window || mode < 0 || mode >= kFsrModeCount) return 0.0f;
     int w = 0, h = 0;
-    SDL_GL_GetDrawableSize(s_window, &w, &h);
+#ifdef SMS_GX_HAVE_VULKAN
+    if (s_vulkan) SDL_Vulkan_GetDrawableSize(s_window, &w, &h);
+    else
+#endif
+        SDL_GL_GetDrawableSize(s_window, &w, &h);
     if (w <= 0 || h <= 0) return 0.0f;
     return fsrInternalScale(kFsrModes[mode].ratio, float(w), float(h), postSettings().aspect == 1, nullptr);
 #else
@@ -1101,6 +1115,7 @@ int GXPC_RequestQuit(void) {
 // The game's settings menu is up (1) or closed (0): like the cheat and warp menus, it frees the mouse
 // that mouse look holds, and mouse look takes it back when the menu closes. The event pump does it.
 void GXPC_SettingsMenuOpen(int open) { s_settingsMenuOpen = open != 0; }
+int GXPC_SettingsMenuIsOpen(void) { return s_settingsMenuOpen ? 1 : 0; }
 int GXPC_IsHeadless(void) { return s_mode != MODE_WINDOW; }
 uint32_t GXPC_FrameCount(void) { return s_frame; }
 

@@ -10,6 +10,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <algorithm>
 #include <initializer_list>
@@ -50,10 +51,14 @@ struct Choice {
 std::vector<Choice> s_choices[OPTION_COUNT];
 bool s_built;
 float s_maxAniso;
-int s_fsrPreferred;       // the FSR mode picked last (or the launcher's): modes that make the same scale tie
+int s_fsrPreferred;       // the FSR mode picked last (or the launcher's, Quality when it gave none)
+float s_scaleOutsideFsr;  // the resolution without FSR 1 or NIS, which the upscaling mode replaces while one is on
 int s_sizesDisplay = -1;  // the display the exclusive sizes were listed for
 
-const float kScales[] = {1, 2, 3, 4, 5, 6, 8};
+// The launcher's choices (Picture sharpness and Anti-aliasing), so that what the menu picks is one it can keep.
+const float kScales[] = {1, 2, 3, 4};
+
+bool upscaling(int filter) { return filter == 3 || filter == 4; }
 
 void resolutionName(float v, char* out, size_t n) {
     if (v == 1.0f) snprintf(out, n, "Native");
@@ -96,9 +101,10 @@ void listNames(int option, std::initializer_list<const char*> names) {
 // The picture can leave the list: the upscaling modes make fractional scales. Lists again, with the
 // scale in force added, when it is not in it.
 void ensureResolution() {
+    static float listedFor = -1.0f;  // the scale the list was made with (a scale FSR left behind leaves it again)
     const float now = efbScale();
-    const std::vector<Choice>& c = s_choices[RESOLUTION];
-    if (!c.empty() && std::any_of(c.begin(), c.end(), [&](const Choice& x) { return fabsf(x.value - now) < 0.005f; })) return;
+    if (!s_choices[RESOLUTION].empty() && fabsf(now - listedFor) < 0.005f) return;
+    listedFor = now;
     list(RESOLUTION, kScales, now, 0.0f, resolutionName);
 }
 
@@ -153,9 +159,16 @@ void build() {
     s_built = true;
     glt::sync([] { s_maxAniso = textureMaxAniso(); });
     const PostSettings post = postSettings();
-    s_fsrPreferred = std::max(0, platformFsrModeAtStart());
+    s_fsrPreferred = platformFsrModeAtStart() >= 0 ? platformFsrModeAtStart() : 1;
+    // With FSR 1 or NIS at the start, the mode made the scale; SMS_GX_SCALE is the one to go back to without them.
+    s_scaleOutsideFsr = efbScale();
+    if (upscaling(post.filter)) {
+        const char* e = getenv("SMS_GX_SCALE");
+        const float asked = e ? float(atof(e)) : 0.0f;
+        s_scaleOutsideFsr = asked >= 1.0f ? std::min(8.0f, asked) : std::max(1.0f, floorf(efbScale() + 0.5f));
+    }
     ensureResolution();
-    static const float kSamples[] = {0, 2, 4, 8, 16};
+    static const float kSamples[] = {0, 2, 4, 8};
     list(MSAA, kSamples, float(rendererMsaa()), float(rendererMaxSamples()), [](float v, char* out, size_t n) {
         if (v < 2.0f) snprintf(out, n, "Off");
         else snprintf(out, n, "%dx", int(v));
@@ -211,6 +224,7 @@ int available(int id) {
     if (!rendererReady()) return 0;
     build();
     switch (id) {
+    case RESOLUTION: return !upscaling(postSettings().filter);  // the upscaling mode sets it then
     case MSAA: return rendererMaxSamples() >= 2;
     case ANISOTROPIC: return s_maxAniso >= 2.0f;
     case FSR_MODE: {
@@ -240,16 +254,9 @@ int get(int id) {
     case FXAA: return post.fxaa ? 1 : 0;
     case FILTER: return nearest(c, float(post.filter));
     case SHARPEN: return nearest(c, post.sharpen);
-    case FSR_MODE: {
-        // The mode is not kept anywhere: it is the one whose scale is what the picture is drawn at now. Modes
-        // that make the same scale (a small window clamps them all to native) go to the one picked last.
-        const float now = efbScale();
-        if (fabsf(platformFsrScale(s_fsrPreferred) - now) < 0.01f) return s_fsrPreferred;
-        int best = 0;
-        for (int i = 1; i < int(c.size()); i++)
-            if (fabsf(platformFsrScale(i) - now) < fabsf(platformFsrScale(best) - now)) best = i;
-        return best;
-    }
+    // The mode picked last (or the launcher's): modes can make the same scale (a small window clamps them all to
+    // native), and the window can change size since, so the scale in force does not say which it was.
+    case FSR_MODE: return std::min(s_fsrPreferred, int(c.size()) - 1);
     case FULLSCREEN: return platformFullscreen() ? 1 : 0;
     case FULLSCREEN_TYPE: return platformExclusive() ? 1 : 0;
     case FULLSCREEN_SIZE: {
@@ -293,17 +300,37 @@ int set(int id, int value) {
         return ok;
     }
     }
+    // the window is the game thread's to measure
+    const float fsrScale = id == FILTER ? platformFsrScale(s_fsrPreferred) : 0.0f;
     glt::sync([&] {
         PostSettings post = postSettings();
         switch (id) {
         case RESOLUTION:
             ok = rendererResize(v, rendererMsaa());
-            if (ok) textureResetSamplers(textureAniso());  // an effect's LOD bias follows the resolution
+            if (ok) {
+                s_scaleOutsideFsr = v;
+                textureResetSamplers(textureAniso());  // an effect's LOD bias follows the resolution
+            }
             return;
         case MSAA: ok = rendererResize(efbScale(), int(v)); return;
         case ANISOTROPIC: textureResetSamplers(v); return;
         case FXAA: post.fxaa = v >= 0.5f; break;
-        case FILTER: post.filter = int(v + 0.5f); break;
+        case FILTER: {
+            // FSR 1 and NIS draw at their mode's scale, as when the game starts with one; without them it is the
+            // resolution again
+            const int filter = int(v + 0.5f);
+            if (upscaling(filter) != upscaling(post.filter)) {
+                const float scale = upscaling(filter) ? fsrScale : s_scaleOutsideFsr;
+                if (upscaling(filter)) s_scaleOutsideFsr = efbScale();
+                if (scale > 0.0f && fabsf(scale - efbScale()) >= 0.005f) {
+                    ok = rendererResize(scale, rendererMsaa());
+                    if (!ok) return;
+                    textureResetSamplers(textureAniso());
+                }
+            }
+            post.filter = filter;
+            break;
+        }
         case SHARPEN: post.sharpen = v; break;
         case BRIGHTNESS: post.gamma = v; break;
         case ASPECT: post.aspect = int(v + 0.5f); break;

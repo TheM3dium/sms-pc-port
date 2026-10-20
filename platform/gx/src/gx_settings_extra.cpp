@@ -4,8 +4,9 @@
 //
 //  - Screen Format: the EFB is as wide as the format needs, and the game's camera must be widened by
 //    the same factor, which it does once, as an area is made (TMarDirector::setupObjects, patch
-//    widescreen-01). So the menu only picks a width; GXPC_ApplyWidescreen, which that patch calls
-//    just before it reads the factor, rebuilds the frame and tells the game which one is in force.
+//    widescreen-01), as do the area's title card and map screen when they load. So the menu only picks
+//    a width; GXPC_ApplyWidescreen, which that patch calls first thing in setupObjects, rebuilds the
+//    frame and tells the game which one is in force.
 //  - Screen Icons At Edges, HDR (on or off, and its look), the button prompts and HD Textures apply at once.
 //  - HD Texture Loading and Shader Warm-up are about what a load does, so they apply from the next
 //    area's.
@@ -252,8 +253,9 @@ int promptPadGet() { return promptsPad(); }
 int promptPadSet(int i) { return promptsSetPad(i) ? 1 : 0; }
 
 // ------------------------------------------------------------------ texture packs
-// Found at the start: a game started with HD textures off has no pack to turn on.
-int texturesAvailable() { return rendererReady() && hiresEnabled(); }
+// Found at the start: a game started with HD textures off has no pack to turn on (Mario's look, which the
+// texture index also holds, is not one).
+int texturesAvailable() { return rendererReady() && hiresHasPack(); }
 int texturesGet() { return hiresActive() ? 1 : 0; }
 
 int texturesSet(int i) {
@@ -346,7 +348,7 @@ const PortSetting* gx_port_settings_extra(int* count) {
     return kSettings;
 }
 
-// Called where the game makes an area's camera (see the top of this file), on the game's thread:
+// Called as the game starts making an area (see the top of this file), on the game's thread:
 // builds the frame at the width the menu chose, if it chose one, and returns the width in force.
 float GXPC_ApplyWidescreen(void) {
     const float want = s_pendingWide.exchange(0.0f);

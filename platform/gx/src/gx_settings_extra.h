@@ -46,6 +46,8 @@ bool promptsSetPad(int pad);
 // and when they are read: 0 as drawn, 1 as a stage loads, 2 the whole pack.
 bool hiresActive();
 void hiresSetActive(bool on);
+// Texture packs were found (not only Mario's look, SMS_MARIO_LOOK, which stays when they are off).
+bool hiresHasPack();
 int hiresLoadMode();
 void hiresSetLoadMode(int mode);
 

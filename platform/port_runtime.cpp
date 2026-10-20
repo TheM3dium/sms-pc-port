@@ -828,6 +828,7 @@ static const struct {
 	{ "vsync", "SMS_VSYNC" },                     // on, off or adaptive
 	{ "fullscreen", "SMS_FULLSCREEN" },           // off, on (desktop) or exclusive
 	{ "fullscreen_mode", "SMS_FULLSCREEN_MODE" }, // WxH@Hz, for exclusive
+	{ "fullscreen_type", "SMS_FULLSCREEN_TYPE" }, // desktop or exclusive: what F11 goes to from a window
 	{ "display", "SMS_DISPLAY" },                 // monitor, 0 = primary
 	{ "renderer", "SMS_GX_BACKEND" },           // opengl (default) or vulkan
 	{ "msaa", "SMS_MSAA" },                     // 0, 2, 4 or 8

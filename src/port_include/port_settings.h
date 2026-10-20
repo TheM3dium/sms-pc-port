@@ -7,6 +7,8 @@
 // launcher and settings.txt (SMS_GX_SCALE, SMS_MSAA, SMS_VOLUME, ...): a change
 // here takes effect at once (or when `deferred` says) and lasts until the game
 // closes; what the game starts with is still the launcher's or settings.txt's.
+// Started by SMS Launcher, the menu's changes are saved for it to keep
+// (port_settings_set), so the next game starts with them.
 //
 // Every module that owns an option describes it with a PortSetting and returns
 // its table from a function (gx_port_settings, port_pad_settings,
@@ -66,6 +68,11 @@ const char* port_settings_page_name(int page);
 int port_settings_page_available(int page);   // 1 when the page has at least one option to show
 int port_settings_count(int page);
 const PortSetting* port_settings_option(int page, int index);
+// Sets an option to a value (as its set()), and when that is done, keeps the change for the launcher:
+// SMS Launcher names a file in SMS_SETTINGS_SAVE, where the changes the menu made are written in the
+// launcher's own values, for it to keep when the game closes. Without it the changes last until the
+// game closes. The value names are what is saved, so a name the launcher does not know is not.
+int port_settings_set(const PortSetting* option, int value);
 
 // The picture as it is now, as "2560 x 2112 with 4x MSAA", for the menu's footer.
 void port_gfx_describe(char* out, int size);

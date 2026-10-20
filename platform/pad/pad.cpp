@@ -81,6 +81,7 @@ __attribute__((weak)) void sms_gx_rumble_shutdown(void);
 __attribute__((weak)) int GXPC_IsHeadless(void);
 __attribute__((weak)) int GXPC_MouseCaptured(void);
 __attribute__((weak)) int GXPC_GameInputBlocked(void);
+__attribute__((weak)) int GXPC_SettingsMenuIsOpen(void);
 __attribute__((weak)) int GXPC_RequestQuit(void);
 }
 
@@ -885,12 +886,15 @@ extern "C" u32 PADRead(PADStatus* status)
 	if (port_camera_mouse_busy > 0)
 		port_camera_mouse_busy--;
 	const bool blocked = GXPC_GameInputBlocked && GXPC_GameInputBlocked();
-	// Port actions on their press, not while a menu has the input.
+	// Port actions on their press, not while a menu has the input (the game's settings menu
+	// included: it reads the pad, so it is not `blocked`, but a save state under it would
+	// open the save state menu behind it, or load one with the settings menu's state).
 	static bool wasSave, wasLoad;
 	const bool save = held(C_SAVESTATE), load = held(C_LOADSTATE);
-	if (save && !wasSave && !blocked)
+	const bool hotkeysBlocked = blocked || (GXPC_SettingsMenuIsOpen && GXPC_SettingsMenuIsOpen());
+	if (save && !wasSave && !hotkeysBlocked)
 		port_savestate_hotkey(PORT_SAVESTATE_HOTKEY_SAVE);
-	if (load && !wasLoad && !blocked)
+	if (load && !wasLoad && !hotkeysBlocked)
 		port_savestate_hotkey(PORT_SAVESTATE_HOTKEY_LOAD_NEWEST);
 	wasSave = save;
 	wasLoad = load;
@@ -1032,8 +1036,15 @@ int camera_speed_percent() { return (int)(port_camera_speed_x * 100.0f + 0.5f); 
 int mouse_sens_percent() { return (int)(g_mouseSens * 100.0f + 0.5f); }
 // The press depth is kept as 0..255, from percent * 255 / 100; this undoes that rounding.
 int soft_trigger_percent() { return (g_softTrigger * 100 + 127) / 255; }
-// 0 is off (SMS_RUMBLE=0 starts with the strength at 0 too, so one number says both).
-int rumble_percent() { return (int)(((u32)g_rumbleStrength * 100 + 0x7FFF) / 0xFFFF); }
+// In the launcher's units: half of SMS_RUMBLE_STRENGTH's percent, so 50 is the console's rumble and
+// 100 runs the motor twice as often (port_rumble_boost). 0 is off (SMS_RUMBLE=0 starts with the
+// strength at 0 too, so one number says both).
+int rumble_percent()
+{
+	const int game = port_rumble_boost > 1.0f ? (int)(port_rumble_boost * 100.0f + 0.5f)
+	                                           : (int)(((u32)g_rumbleStrength * 100 + 0x7FFF) / 0xFFFF);
+	return (game + 1) / 2;
+}
 
 const PortValueList& camera_speed_list()
 {
@@ -1130,10 +1141,12 @@ int rumble_set(int i)
 	const PortValueList& l = rumble_list();
 	if (i < 0 || i >= l.n)
 		return 0;
-	// A strength above 0 is all it takes to turn the motor back on from Off: update_rumble's only
-	// switches are the game's own motor request, focus and this strength. It is sent at once, so a
-	// motor the game has running follows the new strength.
-	g_rumbleStrength = (u16)(l.v[i] * 0xFFFF / 100);
+	// As SMS_RUMBLE_STRENGTH at twice the value (init). A strength above 0 is all it takes to turn
+	// the motor back on from Off: update_rumble's only switches are the game's own motor request,
+	// focus and this strength. It is sent at once, so a motor the game has running follows it.
+	const int game    = l.v[i] * 2;
+	g_rumbleStrength  = (u16)((game < 100 ? game : 100) * 0xFFFF / 100);
+	port_rumble_boost = game > 100 ? game / 100.0f : 1.0f;
 	update_rumble();
 	return 1;
 }
@@ -1143,7 +1156,7 @@ const PortSetting kPadSettings[] = {
 	  "How far the soft L and R keys press, out of 100. Only if they are bound.", 0, NULL, soft_trigger_count,
 	  soft_trigger_name, soft_trigger_get, soft_trigger_set },
 	{ "rumbleStrength", PORT_SETTINGS_PAGE_CONTROLS, 20, "Rumble Strength",
-	  "Rumble strength. Off turns it off. Some adapters are on or off only.", 0, NULL, rumble_count,
+	  "50 is the console's rumble, more runs it more often. Some adapters are on or off.", 0, NULL, rumble_count,
 	  rumble_name, rumble_get, rumble_set },
 	{ "invertCameraX", PORT_SETTINGS_PAGE_GAMEPLAY, 50, "Invert Camera X",
 	  "Flips the C-stick and mouse look left and right.", 0, NULL, off_on_count, off_on_name, invert_x_get,

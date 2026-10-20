@@ -147,6 +147,7 @@ static uint32_t s_uploaded = 0;                            // replacements in GL
 // gave its entries stay, and only what answers draws and asks for textures stops, so turning the
 // textures on again shows each replacement that was ready at once and reads the rest as drawn.
 static std::atomic<bool> s_off{false};
+static size_t s_packFiles = 0;  // the index's replacements from texture packs (not Mario's look), set by scan
 
 static bool endsWith(const std::string& s, const char* suf) {
     size_t n = strlen(suf);
@@ -232,6 +233,7 @@ static void scan() {
     }
     for (auto it = s_index.begin(); it != s_index.end();)  // mips without a level 0
         it = it->second.path.empty() ? s_index.erase(it) : std::next(it);
+    s_packFiles = size_t(std::count_if(s_index.begin(), s_index.end(), [](const auto& f) { return !f.second.look; }));
     if (!s_index.empty()) {
         queryFormats();
         startWorker();
@@ -1410,7 +1412,10 @@ static void finishUpload(Upload& u, int unit) {
 // request/look up replacements; uploads happen at frame boundaries/loading.
 // SMS_TEXTURE_PACK_SYNC=1 decodes on the spot (repeatable captures).
 GLuint hiresTexture(const std::string& name, int unit, uint32_t gxW, uint32_t gxH, int* scale) {
-    if (s_off) return 0;
+    if (s_off) {  // the packs are off, but Mario's look (Customize Mario) stays
+        const auto f = s_index.find(name);
+        if (f == s_index.end() || !f->second.look) return 0;
+    }
     auto it = s_repl.find(name);
     if (it == s_repl.end()) {
         s_repl[name];
@@ -1697,6 +1702,7 @@ uint32_t hiresUploadedCount() { return s_uploaded; }
 // The settings menu (gx_settings_extra.cpp). Active is whether the pack's replacements are shown;
 // the pack is found at the start (a game started with textures off has none: hiresEnabled is false).
 bool hiresActive() { return !s_off; }
+bool hiresHasPack() { return hiresEnabled() && s_packFiles > 0; }
 void hiresSetActive(bool on) { s_off = !on; }
 
 // 0 reads each texture as drawn, 1 prepares what a stage's resources name while it loads, 2 reads

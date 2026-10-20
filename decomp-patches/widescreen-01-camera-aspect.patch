@@ -1,7 +1,7 @@
 Reason: port: SMS_WIDESCREEN widens the game camera's aspect by the displayed width over 4:3, so the view, frustum culling, particles and screen-projected textures all see the wider frame that sms_gx renders; the settings menu's Screen Format takes effect here, as an area is made, since the camera takes the width once
 --- a/src/System/MarDirectorSetupObjects.cpp
 +++ b/src/System/MarDirectorSetupObjects.cpp
-@@ -38,6 +38,15 @@
+@@ -39,6 +39,15 @@
  #include <sms_modhook.h>
  #endif
  
@@ -17,13 +17,24 @@ Reason: port: SMS_WIDESCREEN widens the game camera's aspect by the displayed wi
  extern void* gpSceneCmnDat;
  extern int gpSceneCmnDatSize;
  
-@@ -397,6 +406,11 @@
+@@ -177,6 +186,12 @@
+ bool TMarDirector::setupObjects()
+ {
+ #ifdef TARGET_PC
++	// The settings menu's Screen Format, before anything of the area (its
++	// title card, the map screen, the camera below) is laid out for a width.
++	if (GXPC_ApplyWidescreen)
++		port_widescreen = GXPC_ApplyWidescreen();
++#endif
++#ifdef TARGET_PC
+ 	// BetterSunshineEngine (word at retail 0x802B7720): a nop replaces this
+ 	// call (its initStageCallbacks, which calls setupObjects, resets first).
+ 	if (SMS_MOD_WORD(0x802B7720, 0) != 0x60000000)
+@@ -396,6 +411,9 @@
  #endif
  		cam->mAspect = (u16)SMSGetGameVideoWidth() * 0.91346145f
  		               / (u16)SMSGetGameVideoHeight();
 +#ifdef TARGET_PC
-+		if (GXPC_ApplyWidescreen)
-+			port_widescreen = GXPC_ApplyWidescreen();
 +		cam->mAspect *= port_widescreen;
 +#endif
  	}

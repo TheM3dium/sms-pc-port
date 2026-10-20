@@ -5,7 +5,8 @@
 // bouncing as the pause menu's options do, with the pointing hand beside it.
 // Up and down choose, left and right (or A) change an option or open a page, B
 // goes back a level and, from the pages, to the pause menu. The changes show at
-// once, behind the menu, and last until the game closes.
+// once, behind the menu. Started by SMS Launcher, they are saved for it to keep
+// (port_settings_set); otherwise they last until the game closes.
 //
 // It draws as the save state menu does, with the game's system font and the
 // HUD's art (port_menu_draw.h), and plays the pause menu's own sounds.
@@ -70,9 +71,15 @@ bool onPages() { return sPage < 0; }
 
 const PortSetting* optionAt(int row) { return port_settings_option(sPage, row); }
 
-// The rows change with the settings (an option shows only while it applies): count them again.
+// The option the selection is on, so that it stays on it when rows above it come or go.
+const PortSetting* sCurrent;
+void remember() { sCurrent = onPages() ? NULL : optionAt(sSelected); }
+
+// The rows change with the settings (an option shows only while it applies): count them again,
+// keeping the selection on the option it was on when rows above it come or go.
 void recount()
 {
+	const PortSetting* selected = onPages() ? NULL : sCurrent;
 	if (onPages()) {
 		sPageCount = 0;
 		for (int page = 0; page < PORT_SETTINGS_PAGE_COUNT; page++)
@@ -81,9 +88,15 @@ void recount()
 		sRowCount = sPageCount;
 	} else {
 		sRowCount = port_settings_count(sPage);
+		for (int row = 0; selected && row < sRowCount; row++)
+			if (optionAt(row) == selected) {
+				sSelected = row;
+				break;
+			}
 	}
 	if (sSelected >= sRowCount)
 		sSelected = sRowCount > 0 ? sRowCount - 1 : 0;
+	remember();
 }
 
 int listTarget()
@@ -104,6 +117,7 @@ void select(int row)
 	sSelected = row;
 	sNote[0]  = 0;
 	sTicks    = 0;
+	remember();
 	sound(MSD_SE_SY_CURSOR);
 }
 
@@ -112,6 +126,7 @@ void openPage(int row)
 	sSelectedPage = row;
 	sPage         = sPages[row];
 	sSelected     = 0;
+	sCurrent      = NULL;
 	sFirst        = 0.0f;
 	sNote[0]      = 0;
 	sTicks        = 0;
@@ -137,6 +152,8 @@ void change(int delta, bool wrap)
 	if (!option)
 		return;
 	const int count = option->count();
+	if (count <= 0)
+		return;
 	const int now   = option->get();
 	int next        = now + delta;
 	if (wrap)
@@ -146,7 +163,7 @@ void change(int delta, bool wrap)
 	sNote[0] = 0;
 	if (next == now)
 		return;
-	if (option->set(next)) {
+	if (port_settings_set(option, next)) {
 		sound(MSD_SE_SY_DECIDE);
 	} else {
 		snprintf(sNote, sizeof sNote, "This computer cannot do that");
@@ -230,6 +247,8 @@ void SettingsMenuMove(TMarioGamePad* pad)
 	if (!sOpen)
 		return;
 	++sTicks;
+	if (!onPages())
+		recount(); // an option can come or go meanwhile (HDR as the window moves, a monitor plugged in)
 	sPreview = (pad->getButton() & JUTGamePad::X) != 0;
 	if (sPreview)
 		return;
@@ -267,6 +286,9 @@ void SettingsMenuSetAlpha(u8 alpha) { sAlpha = alpha; }
 
 void SettingsMenuDraw(const JDrama::TRect& screen)
 {
+	// The menu's state is the game's (see the top): after a save state's load, the window's idea of
+	// whether the menu is open (the mouse it frees) follows it here.
+	GXPC_SettingsMenuOpen(sOpen ? 1 : 0);
 	const u8 alpha = sAlpha;
 	if (!sOpen || !alpha || sPreview)
 		return;
