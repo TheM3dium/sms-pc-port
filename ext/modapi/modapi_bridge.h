@@ -51,6 +51,17 @@ int modg_player_set_water(int water);
 int modg_player_set_status(uint32_t status, uint32_t arg);
 
 int modg_camera_get(SmsCamera* out);
+
+int modg_world_area_kind(int area);
+int modg_world_of(int area);
+int modg_world_episode_count(int area);
+int modg_world_episode_shine(int area, int episode);
+int modg_world_episode_name(int area, int episode, char* out, int size);
+int modg_world_next_episode(int area);
+int modg_world_shine_episode(int shine, int* area);
+int modg_world_has_cutscene(const char* name);
+int modg_world_play_cutscene(const char* name, const SmsVec3* focus, int frames);
+int modg_world_cutscene_playing(void);
 void modg_play_system_sound(uint32_t id);
 void* modg_native(const char* name);
 

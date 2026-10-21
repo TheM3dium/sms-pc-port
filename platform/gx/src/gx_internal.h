@@ -358,9 +358,12 @@ enum OverlaySlot {
     OVERLAY_EXT_NOTICE,  // extensions' text (gx_ext_overlay.cpp)
     OVERLAY_EXT_STATUS,
     OVERLAY_EXT_BANNER,
+    OVERLAY_EXT_BOARD,
+    OVERLAY_EXT_SCREEN,  // a colour over the window
     OVERLAY_AUTOSAVE,    // auto save's indicator (gx_autosave_overlay.cpp)
     OVERLAY_EXT_LABEL,   // names over players: GXPC_MAX_LABELS slots from here
-    OVERLAY_SLOTS = OVERLAY_EXT_LABEL + 8
+    OVERLAY_EXT_MARKER = OVERLAY_EXT_LABEL + 8,  // a server mod's markers: GXPC_MAX_MARKERS slots
+    OVERLAY_SLOTS = OVERLAY_EXT_MARKER + 8
 };
 // Where GXPC_PresentXFB last put the game's picture in the window (from its top left).
 struct PresentRect { int x, y, w, h; };

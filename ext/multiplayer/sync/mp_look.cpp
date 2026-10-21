@@ -326,6 +326,12 @@ extern "C" int mpg_dress(int slot, int character, const char* textureName, const
 	return 1;
 }
 
+extern "C" void mpg_undress(const void* data, size_t bytes)
+{
+	if (data && bytes && GXPC_SetTextureOverride)
+		GXPC_SetTextureOverride(data, bytes, nullptr, 0, 0);
+}
+
 extern "C" void mpg_undress_all(void)
 {
 	if (GXPC_ClearTextureOverrides)

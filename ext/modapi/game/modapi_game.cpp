@@ -12,7 +12,12 @@
 #include "port_framerate.h"
 
 #include <Camera/Camera.hpp>
+#include <Camera/CameraBck.hpp>
+#include <Camera/CameraMapTool.hpp>
 #include <Camera/CubeManagerBase.hpp>
+#include <GC2D/MessageUtil.hpp>
+#include <GC2D/ShineTable.hpp>
+#include <JSystem/JKernel/JKRFileLoader.hpp>
 #include <JSystem/JDrama/JDRNameRefGen.hpp>
 #include <JSystem/JDrama/JDRPlacement.hpp>
 #include <MSound/MSound.hpp>
@@ -28,12 +33,20 @@
 #include <System/MarDirector.hpp>
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 namespace {
 
 bool s_stageReady; // between a stage's setup and leaving it
 uint32_t s_tick;   // ticks since the stage's setup
+bool s_started;    // SMS_EV_STAGE_START sent for this stage
+
+// Why the game leaves (SmsEvStage.reason): what asked since the stage was set
+// up, read when it goes (chooseNextStage); kept for the next stage's events.
+bool s_wayOutAsked, s_warpAsked, s_missAsked;
+int s_lastReason = SMS_LEAVE_OTHER, s_lastShine = -1;
+int s_stageShine = -1; // the last Shine collected in this stage
 
 SmsObject obj(JDrama::TNameRef* p) { return (SmsObject)p; }
 JDrama::TNameRef* ref(SmsObject o) { return (JDrama::TNameRef*)o; }
@@ -71,11 +84,14 @@ void setVec(SmsVec3* v, f32 x, f32 y, f32 z)
 
 // ------------------------------------------------------------------ hooks
 
+void stageStart();
+
 void frame()
 {
 	static uint32_t s_frame;
 	if (gameMode() != SMS_MODE_STAGE)
 		s_stageReady = false;
+	stageStart();
 	modh_frame(s_frame++, gameMode());
 }
 
@@ -109,49 +125,136 @@ void afterMovement()
 
 void stageSetup()
 {
-	s_stageReady = true;
-	s_tick       = 0;
+	s_stageReady  = true;
+	s_tick        = 0;
+	s_started     = false;
+	s_wayOutAsked = s_warpAsked = s_missAsked = false;
+	s_stageShine  = -1;
 	SmsEvStage ev;
 	ev.area    = gpApplication.mCurrArea.unk0;
 	ev.episode = gpApplication.mCurrArea.unk1;
+	ev.reason  = s_lastReason;
+	ev.shine   = s_lastShine;
 	modh_dispatch(SMS_EV_STAGE_LOADED, &ev, sizeof ev);
+}
+
+// The first frame of play after the stage's opening (TMarDirector::changeState
+// goes through its opening states to STATE_UNK4, where the game is played).
+void stageStart()
+{
+	if (s_started || !s_stageReady || !gpMarDirector || !gpMarioOriginal
+	    || gpMarDirector->mState != TMarDirector::STATE_UNK4)
+		return;
+	s_started = true;
+	SmsEvStage ev;
+	ev.area    = gpApplication.mCurrArea.unk0;
+	ev.episode = gpApplication.mCurrArea.unk1;
+	ev.reason  = s_lastReason;
+	ev.shine   = s_lastShine;
+	modh_dispatch(SMS_EV_STAGE_START, &ev, sizeof ev);
 }
 
 int allowNextStage(unsigned code, void* actor)
 {
-	if (!modh_wants(SMS_EV_STAGE_EXIT_REQUEST))
-		return 1;
-	SmsEvStageExit ev;
-	ev.code    = code;
-	ev.area    = (int)((code >> 8) & 0xFF) - 1;
-	ev.episode = (int)(code & 0xFF);
-	ev.actor   = actor ? obj((JDrama::TActor*)actor) : 0;
-	return !modh_dispatch(SMS_EV_STAGE_EXIT_REQUEST, &ev, sizeof ev);
+	if (modh_wants(SMS_EV_STAGE_EXIT_REQUEST)) {
+		SmsEvStageExit ev;
+		ev.code    = code;
+		ev.area    = (int)((code >> 8) & 0xFF) - 1;
+		ev.episode = (int)(code & 0xFF);
+		ev.actor   = actor ? obj((JDrama::TActor*)actor) : 0;
+		if (modh_dispatch(SMS_EV_STAGE_EXIT_REQUEST, &ev, sizeof ev))
+			return 0;
+	}
+	s_wayOutAsked = true;
+	return 1;
+}
+
+// The Shine that ended the stage: the one the player touched, else the last
+// one whose flag was set here (multiplayer's host saving another player's).
+int stageShine()
+{
+	TMarDirector* d = gpMarDirector;
+	if (d && d->unk25C)
+		return (int)d->unk25C->getEventId();
+	return s_stageShine;
+}
+
+// Why the game is leaving now (the director's state as it goes).
+int leaveReason()
+{
+	TMarDirector* d = gpMarDirector;
+	if (s_missAsked)
+		return SMS_LEAVE_LIFE_LOST;
+	if (d && (d->mState == TMarDirector::STATE_UNK7 || (d->mState == TMarDirector::STATE_CARD_SAVE && d->unk261 == 7)))
+		return SMS_LEAVE_GAME_OVER;
+	if (d && d->mState == TMarDirector::STATE_PAUSE_MENU)
+		return SMS_LEAVE_EXIT_AREA;
+	if (d && d->checkFlag(TMarDirector::DIRECTOR_FLAG_SHINE_TAKEN))
+		return SMS_LEAVE_SHINE;
+	if (s_warpAsked)
+		return SMS_LEAVE_WARP;
+	if (s_wayOutAsked)
+		return SMS_LEAVE_WAY_OUT;
+	return SMS_LEAVE_OTHER;
+}
+
+// A world's way in (TMarDirector::moveStage: with no episode, its select).
+bool isWorldEntry(int area)
+{
+	return area == 2 || area == 3 || area == 4 || area == 5 || area == 6 || area == 8 || area == 9;
 }
 
 // An event whose payload is a stage the handlers may change, applied to `seq`.
-void stageEvent(uint32_t type, TGameSequence& seq)
+// Returns 1 when a handler changed it.
+int stageEvent(uint32_t type, TGameSequence& seq, int reason, int shine)
 {
 	if (!modh_wants(type))
-		return;
+		return 0;
 	SmsEvStage ev;
 	ev.area    = seq.unk0;
 	ev.episode = seq.unk1;
+	ev.reason  = reason;
+	ev.shine   = shine;
 	modh_dispatch(type, &ev, sizeof ev);
-	if (ev.area != seq.unk0 || ev.episode != seq.unk1) {
-		seq.unk0    = (u8)ev.area;
-		seq.unk1 = (u8)ev.episode;
-	}
+	if (ev.area < 0 || ev.area > 254 || ev.episode < 0 || ev.episode > 255 || (ev.area == seq.unk0 && ev.episode == seq.unk1))
+		return 0;
+	seq.unk0 = (u8)ev.area;
+	seq.unk1 = (u8)ev.episode;
+	return 1;
 }
 
-void moveStage()
+void chooseNextStage()
 {
-	stageEvent(SMS_EV_STAGE_LEAVING, gpApplication.mNextArea);
-	s_stageReady = false;
+	const int reason = leaveReason();
+	const int shine  = reason == SMS_LEAVE_SHINE ? stageShine() : -1;
+	TGameSequence& next = gpApplication.mNextArea;
+	if (stageEvent(SMS_EV_STAGE_LEAVING, next, reason, shine) && next.unk1 != 0xFF && isWorldEntry(next.unk0)) {
+		// a mod named a world's episode: as its episode select would have
+		// (TSelectDir records the choice), and as a new visit starts, with no coins
+		// (TMarDirector::moveStage resets them only on going to another world)
+		TFlagManager::getInstance()->setFlag(0x40003, next.unk1);
+		const TGameSequence& cur = gpApplication.mCurrArea;
+		if (SMS_getShineStage(next.unk0) == SMS_getShineStage(cur.unk0) && next.unk1 != cur.unk1)
+			TFlagManager::getInstance()->setFlag(0x40002, 0);
+	}
+	s_lastReason = reason;
+	s_lastShine  = shine;
 }
 
-void missNextArea() { stageEvent(SMS_EV_LIFE_LOST, gpApplication.mNextArea); }
-void afterFileSelect() { stageEvent(SMS_EV_FILE_SELECTED, gpApplication.mNextArea); }
+void moveStage() { s_stageReady = false; }
+
+void missNextArea()
+{
+	s_missAsked = true;
+	stageEvent(SMS_EV_LIFE_LOST, gpApplication.mNextArea, SMS_LEAVE_LIFE_LOST, -1);
+}
+
+void afterFileSelect()
+{
+	stageEvent(SMS_EV_FILE_SELECTED, gpApplication.mNextArea, SMS_LEAVE_FILE, -1);
+	s_lastReason = SMS_LEAVE_FILE;
+	s_lastShine  = -1;
+}
 int takeGameOver() { return modh_dispatch(SMS_EV_GAME_OVER, 0, 0); }
 int keepCoinsOnMiss() { return modh_dispatch(SMS_EV_COINS_RESET, 0, 0); }
 
@@ -313,6 +416,7 @@ int playerDamage(void* m, int* amount)
 
 void shineCollected(int shine, int total)
 {
+	s_stageShine = shine;
 	SmsEvShine ev;
 	ev.shine = shine;
 	ev.total = total;
@@ -334,6 +438,7 @@ struct Register {
 		e.stageSetup          = stageSetup;
 		e.allowNextStage      = allowNextStage;
 		e.moveStage           = moveStage;
+		e.chooseNextStage     = chooseNextStage;
 		e.missNextArea        = missNextArea;
 		e.takeGameOver        = takeGameOver;
 		e.keepCoinsOnMiss     = keepCoinsOnMiss;
@@ -386,6 +491,7 @@ extern "C" int modg_warp(int area, int episode)
 {
 	if (!s_stageReady || !gpMarDirector || area < 0 || area > 254 || episode < 0 || episode > 255)
 		return 0;
+	s_warpAsked = true;
 	gpMarDirector->setNextStage((u16)(((area + 1) << 8) | episode), 0);
 	return 1;
 }
@@ -605,4 +711,164 @@ extern "C" void* modg_native(const char* name)
 	if (!strcmp(name, "gpMap"))
 		return gpMap;
 	return 0;
+}
+
+// ------------------------------------------------------------------ worlds and episodes
+//
+// The game's own tables (GC2D/ShineTable.hpp, System/StageUtil): an area's
+// shine stage is its world (0 the Airstrip, 1 the plaza, 2 to 8 the seven
+// worlds, 9 Corona Mountain), and a world's eight episodes are the shines of
+// scShineConvTable, as the episode select and the pause menu read them.
+
+namespace {
+
+const int kAreas = 61; // System/StageUtil.cpp's shineStageTable
+const int kWorldArea[10] = {0, 1, 2, 3, 4, 5, 6, 8, 9, 52}; // the area each world is entered by
+
+int worldIndex(int area) { return area >= 0 && area < kAreas ? SMS_getShineStage((u8)area) : -1; }
+
+// A world with episodes (its shine table), by world index.
+const u8* episodeTable(int area)
+{
+	const int w = worldIndex(area);
+	return w >= 2 && w <= 8 && area != 15 ? scShineConvTable[w] : 0;
+}
+
+// The overlay's text: the message bank's escape sequences (0x1A, then their
+// length) left out, accented letters without their accents, one line (as the
+// warp menu's, zzz-warp-01).
+int plainText(char* out, int n, const char* msg)
+{
+	static const char kFold[] = "AAAAAAACEEEEIIIIDNOOOOO OUUUUY saaaaaaaceeeeiiiidnooooo ouuuuy y";
+	int len = 0;
+	const u8* p = (const u8*)msg;
+	while (p && *p && len + 1 < n) {
+		u8 c = *p;
+		if (c == 0x1A) {
+			const u8 size = p[1];
+			if (size < 2)
+				break;
+			for (u8 i = 0; i < size && *p; i++)
+				p++;
+			continue;
+		}
+		p++;
+		if (c == '\n' || c == '\r' || c == '\t')
+			c = ' ';
+		else if (c >= 0xC0)
+			c = (u8)kFold[c - 0xC0];
+		if (c < 0x20 || c >= 0x7F || (c == ' ' && (len == 0 || out[len - 1] == ' ')))
+			continue;
+		out[len++] = (char)c;
+	}
+	while (len && out[len - 1] == ' ')
+		len--;
+	out[len] = 0;
+	return len;
+}
+
+char s_cutsceneName[64];          // fireStartDemoCamera keeps the pointers it is given
+JGeometry::TVec3<f32> s_cutsceneFocus;
+
+} // namespace
+
+extern "C" int modg_world_area_kind(int area)
+{
+	const int w = worldIndex(area);
+	if (w < 0)
+		return SMS_AREA_NONE;
+	if (area == 15)
+		return SMS_AREA_TITLE;
+	if (w == 0)
+		return SMS_AREA_AIRSTRIP;
+	if (w == 9)
+		return SMS_AREA_FINAL;
+	if (area > 0x14 && area < 0x35) // SMS_isExMap
+		return SMS_AREA_SECRET;
+	if (w == 1)
+		return SMS_AREA_PLAZA;
+	return isWorldEntry(area) ? SMS_AREA_WORLD : SMS_AREA_WORLD_PART;
+}
+
+extern "C" int modg_world_of(int area)
+{
+	const int w = worldIndex(area);
+	return w >= 0 && w <= 9 && area != 15 ? kWorldArea[w] : -1;
+}
+
+extern "C" int modg_world_episode_count(int area) { return episodeTable(area) ? 8 : 0; }
+
+extern "C" int modg_world_episode_shine(int area, int episode)
+{
+	const u8* t = episodeTable(area);
+	return t && episode >= 0 && episode < 8 ? t[episode] : -1;
+}
+
+extern "C" int modg_world_next_episode(int area)
+{
+	// TSelectMenu::initData: the one after the newest whose Shine is had
+	const u8* t = episodeTable(area);
+	if (!t)
+		return -1;
+	int next = 0;
+	for (int i = 0; i < 8; i++)
+		if (TFlagManager::getInstance()->getShineFlag(t[i]))
+			next = i + 1;
+	return next > 7 ? 7 : next;
+}
+
+extern "C" int modg_world_shine_episode(int shine, int* area)
+{
+	for (int w = 2; w <= 8; w++)
+		for (int i = 0; i < 8; i++)
+			if (scShineConvTable[w][i] == shine) {
+				if (area)
+					*area = kWorldArea[w];
+				return i;
+			}
+	return -1;
+}
+
+extern "C" int modg_world_episode_name(int area, int episode, char* out, int size)
+{
+	if (!out || size <= 0)
+		return 0;
+	out[0]          = 0;
+	const int shine = modg_world_episode_shine(area, episode);
+	void* bmg       = JKRFileLoader::getGlbResource("/common/2d/scenarioname.bmg");
+	if (shine < 0 || shine >= (int)(sizeof scScenarioNameTable / sizeof scScenarioNameTable[0]) || !bmg)
+		return 0;
+	return plainText(out, size, SMSGetMessageData(bmg, SMS_getNormalStage(shine)));
+}
+
+extern "C" int modg_world_has_cutscene(const char* name)
+{
+	if (!name || !*name || !s_stageReady || !gpCamera)
+		return 0;
+	if (gpCamera->unk2B0 && gpCamera->unk2B0->isFileExist(name))
+		return 1;
+	return gpCamMapToolTable && gpCamMapToolTable->searchF(JDrama::TNameRef::calcKeyCode(name), name) ? 1 : 0;
+}
+
+extern "C" int modg_world_cutscene_playing(void)
+{
+	TMarDirector* d = s_stageReady ? gpMarDirector : 0;
+	return d && (d->isTalkOrDemoModeNow() || d->checkFlag(TMarDirector::DIRECTOR_FLAG_DEMO_PENDING)
+	             || (gpCamera && gpCamera->isDemoCamera()))
+	           ? 1
+	           : 0;
+}
+
+extern "C" int modg_world_play_cutscene(const char* name, const SmsVec3* focus, int frames)
+{
+	TMarDirector* d = s_stageReady ? gpMarDirector : 0;
+	if (!d || !gpMarioOriginal || d->mState != TMarDirector::STATE_UNK4 || modg_world_cutscene_playing()
+	    || !modg_world_has_cutscene(name)
+	    || d->checkFlag(TMarDirector::DIRECTOR_FLAG_SHINE_TAKEN | TMarDirector::DIRECTOR_FLAG_STAGE_TRANSITION_PENDING))
+		return 0;
+	snprintf(s_cutsceneName, sizeof s_cutsceneName, "%s", name);
+	if (focus)
+		s_cutsceneFocus.set(focus->x, focus->y, focus->z);
+	d->fireStartDemoCamera(s_cutsceneName, focus ? &s_cutsceneFocus : 0, frames, 0.0f, true, 0, 0, 0, 0);
+	return 1;
 }

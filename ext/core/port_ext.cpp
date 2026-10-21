@@ -59,6 +59,7 @@ extern "C" int port_ext_allow_next_stage(unsigned code, void* actor)
 
 extern "C" void port_ext_move_stage(void)
 {
+	EACH(chooseNextStage) s_ext[i]->chooseNextStage();
 	EACH(moveStage) s_ext[i]->moveStage();
 }
 

@@ -1,0 +1,29 @@
+Reason: port: each object's scene record as the loader made it from one (TNameRef::genObject), for multiplayer's server SPAWN (ext/multiplayer/game/mp_spawn.cpp)
+--- a/libs/JSystem/src/JDrama/JDRNameRef.cpp
++++ b/libs/JSystem/src/JDrama/JDRNameRef.cpp
+@@ -33,10 +33,25 @@
+ 	return remainder.readString();
+ }
+ 
++#ifdef TARGET_PC
++// Port: each object as made from its record (scene.bin's, while a stage
++// loads), for multiplayer's server SPAWN, which makes copies from them.
++extern "C" void port_spawn_record(void* object, const void* record, unsigned size) __attribute__((weak));
++#endif
++
+ TNameRef* TNameRef::genObject(JSUMemoryInputStream& stream,
+                               JSUMemoryInputStream& remainder)
+ {
++#ifdef TARGET_PC
++	const u8* record = (const u8*)stream.mBuffer + stream.mPosition;
++	const s32 at     = stream.mPosition;
++	TNameRef* made   = TNameRefGen::getInstance()->getNameRef(getType(stream, remainder));
++	if (made && port_spawn_record)
++		port_spawn_record(made, record, (unsigned)(stream.mPosition - at));
++	return made;
++#else
+ 	return TNameRefGen::getInstance()->getNameRef(getType(stream, remainder));
++#endif
+ }
+ 
+ TNameRef::~TNameRef() { }

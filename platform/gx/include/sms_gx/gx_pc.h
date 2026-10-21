@@ -215,9 +215,24 @@ int GXPC_ReadXFB(const void* xfb, uint8_t* rgba, int* w, int* h);
 // near the top or the status panel in the top right; lines split at '\n',
 // "" or NULL hides it. Any thread; only a window shows it, not SMS_SHOTS.
 // The banner is big text in the middle of the window (a server mod's: a race's
-// countdown, its winner); a text starting "#rrggbb " is drawn in that colour.
-enum { GXPC_EXT_OVERLAY_NOTICE, GXPC_EXT_OVERLAY_STATUS, GXPC_EXT_OVERLAY_BANNER, GXPC_EXT_OVERLAY_PANELS };
+// countdown, its winner); a text starting "#rrggbb " is drawn in that colour,
+// and so is a line of it starting so. The board is lines at the left (a
+// server mod's standings).
+enum { GXPC_EXT_OVERLAY_NOTICE, GXPC_EXT_OVERLAY_STATUS, GXPC_EXT_OVERLAY_BANNER, GXPC_EXT_OVERLAY_BOARD,
+       GXPC_EXT_OVERLAY_PANELS };
 void GXPC_ExtOverlaySet(int panel, const char* text);
+// Markers on the game's picture (a server mod's): text over a point, or a
+// downward arrow when the text is "", in a colour (0xRRGGBBAA), at x, y (0..1
+// of the picture, the marker's bottom centre). Replaces the last list. And a
+// colour over the whole window (a fade, a flash): 0xRRGGBBAA, alpha 0 none.
+#define GXPC_MAX_MARKERS 8
+typedef struct GXPCMarker {
+    char text[24];
+    float x, y, alpha;
+    uint32_t rgba;
+} GXPCMarker;
+void GXPC_ExtOverlayMarkers(const GXPCMarker* markers, int count);
+void GXPC_ExtOverlayScreen(uint32_t rgba);
 
 // Auto save's indicator (ext/autosave, gx_autosave_overlay.cpp): SAVING turns
 // a Shine at the bottom left of the game's picture; SAVED stops it beside

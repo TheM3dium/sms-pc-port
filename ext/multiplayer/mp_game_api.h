@@ -125,6 +125,12 @@ typedef struct MpgPose {
 	uint8_t pad2[3];
 	float emitPos[2][3], emitDir[2][3], emitSpeed[3];
 	float pressure;
+	// what the player presses (their controller as read, before a server
+	// holds it), for server mods; after what older games send
+	uint8_t hasPad;
+	uint16_t padButtons;
+	int8_t padStick[4];   // the stick's x, y, the C-stick's x, y
+	uint8_t padTrigger[2];
 } MpgPose;
 
 // An enemy as the host's game has it, named by its manager's place in the
@@ -332,15 +338,65 @@ enum {
 	MPG_CMD_ACTORS,     // actor types i[0]..i[1]: i[2] 0 shown, 1 hidden, 2 killed
 	MPG_CMD_STOP_SCRIPT, // text: the stage's event script loaded from that resource
 	MPG_CMD_STAY,       // i[0]: the player's own ways out of the stage lead nowhere
-	MPG_CMD_LAST = MPG_CMD_STAY,
+	MPG_CMD_OBJECT,     // the i[2]th (-1 each) object of types i[0]..i[1] and kind text: i[3] MPG_OBJECT_*
+	MPG_CMD_SPAWN,      // a copy of the i[2]th object of types i[0]..i[1] and kind text (types 0: an item named text), as i[3]
+	MPG_CMD_PLAYER,     // the player: i[0] MPG_PLAYER_*
+	MPG_CMD_RULES,      // i[0]: MPG_RULE_* bits
+	MPG_CMD_BOARD,      // row i[0] (0..7; -1 all) of the board: text in i[1]'s colour; "" clears it
+	MPG_CMD_HUD,        // i[0]: MPG_HUD_* bits of the HUD hidden
+	MPG_CMD_MARKER,     // marker i[0] (0..7): text over f[0..2], or over slot i[1] (-1 none); i[3] 1 takes it away
+	MPG_CMD_SCREEN,     // i[0] MPG_SCREEN_*: in i[1]'s colour over f[0] seconds
+	MPG_CMD_SHAKE,      // the camera shakes, f[0] strong (1 a hard hit), for f[1] seconds
+	MPG_CMD_RUMBLE,     // the controller: i[0] 0 weak, 1 hard, i[1] times
+	MPG_CMD_LAST = MPG_CMD_RUMBLE,
 };
+// Host only (not sent): forget the sticky command of this kind, as sticky
+// commands replace each other, without sending anything.
+#define MPG_CMD_UNSTICK 2
+// MPG_CMD_OBJECT's i[3] (the mod SDK's SMS_OBJECT_*)
+enum {
+	MPG_OBJECT_PLACE = 0, // to f[0..2], turned f[3] degrees: where it goes back to too
+	MPG_OBJECT_SPEED,     // f[0] times its own speed (a spinner's turning, along its rail)
+	MPG_OBJECT_PHASE,     // back to its start, then f[0] seconds of its own movement at once
+	MPG_OBJECT_SHOW,
+	MPG_OBJECT_HIDE,      // out of the stage: unseen, nothing to touch or stand on
+	MPG_OBJECT_SCALE,     // f[0..2] its size (1 as made)
+	MPG_OBJECT_TURN,      // f[0..2] its turn about x, y, z, degrees
+	MPG_OBJECT_MOVE,      // to f[0..2] turned f[3] degrees, gliding there over f[4] seconds
+	MPG_OBJECT_KILL,      // gone for this stage
+};
+// MPG_CMD_PLAYER's i[0]
+enum {
+	MPG_PLAYER_LOSE_LIFE = 0, // the game's own miss, now
+	MPG_PLAYER_LAUNCH,        // thrown along f[0..2] at f[3] units a frame
+	MPG_PLAYER_DISMOUNT,      // off a Blooper or Yoshi
+	MPG_PLAYER_HEALTH,        // i[1]: 0..8
+	MPG_PLAYER_WATER,         // i[1]: FLUDD's tank, percent
+	MPG_PLAYER_NOZZLE,        // i[1]: 0 spray, 1 rocket, 2 underwater, 4 hover, 5 turbo
+};
+// MPG_CMD_RULES's bits
+#define MPG_RULE_NO_FLUDD   1u
+#define MPG_RULE_NO_DAMAGE  2u
+#define MPG_RULE_NO_PAUSE   4u
+#define MPG_RULE_NO_PICKUPS 8u
+// MPG_CMD_HUD's bits
+#define MPG_HUD_COINS      1u
+#define MPG_HUD_SHINES     2u
+#define MPG_HUD_BLUE_COINS 4u
+#define MPG_HUD_HEALTH     8u
+#define MPG_HUD_WATER      16u
+#define MPG_HUD_LIVES      32u
+#define MPG_HUD_RED_COINS  64u
+#define MPG_HUD_ALL        0xFFFFu
+// MPG_CMD_SCREEN's i[0]
+enum { MPG_SCREEN_CLEAR = 0, MPG_SCREEN_FADE_OUT, MPG_SCREEN_FADE_IN, MPG_SCREEN_FLASH };
 #define MPG_CMD_STICKY 1
 #define MPG_CMD_TEXT 160
 typedef struct MpgCmd {
 	uint8_t type, flags;
 	uint32_t delayMs; // from when the host sent it
 	int32_t i[4];
-	float f[4];
+	float f[8];       // f[4..7] after the text on the wire (older games stop before them)
 	char text[MPG_CMD_TEXT];
 } MpgCmd;
 // Host: carry out `cmd` in the games of the players in `to` (bit n: slot n;
@@ -396,6 +452,36 @@ const char* mpg_display_name(int slot);
 // or "" (0) for Mario's own; mpg_looks_version changes whenever one does.
 uint32_t mpg_looks_version(void);
 int mpg_look(int slot, char* out, int size);
+// Host: `slot`'s look forced by a server mod, in every game (theirs too) and
+// for newcomers, until set again; null gives them their own back.
+int mpg_server_set_look(int slot, const char* look);
+// This game's player wears a look other than its own (a server mod's): its
+// own Mario is painted (mp_game.cpp), not left to the launcher's texture pack.
+int mpg_own_look_forced(void);
+// Host: where `slot` comes back each time they arrive in the session, after
+// its sticky commands: how 1 a warp to x, y, z facing yaw, 2 onto a Blooper
+// there, 0 the stage's own.
+int mpg_server_set_respawn(int slot, int how, float x, float y, float z, float yaw);
+// Undoes mpg_dress for one texture (our own Mario, its own look again).
+void mpg_undress(const void* data, size_t bytes);
+// This game's controller as read, before a server held it (game half).
+int mpg_local_pad(uint16_t* buttons, int8_t stick[4], uint8_t trigger[2]);
+// The stage's objects as this game has them (game half, mp_server.cpp),
+// picked as MPG_CMD_OBJECT picks them: how many (index < 0), or the
+// index-th into out (1, or 0 when none). And the ground at a point.
+typedef struct MpgObjectInfo {
+	uint32_t type;
+	char kind[32];
+	float position[3], rotation[3], scale[3];
+	int alive, hidden, spawned;
+} MpgObjectInfo;
+int mpg_objects(uint32_t lo, uint32_t hi, const char* kind, int index, MpgObjectInfo* out);
+typedef struct MpgGround {
+	float floor, waterY, roof;
+	uint32_t floorType;
+	int water, hasWater;
+} MpgGround;
+int mpg_ground(float x, float y, float z, MpgGround* out);
 // A player's picture for one of their model's textures, by the texture's name
 // in the model ("H_ma_new_main_s3tc"): their colours (else their character's)
 // painted over Mario's (sync/mp_look.cpp, from the launcher's SMS_MARIO_PAINT),

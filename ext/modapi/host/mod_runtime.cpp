@@ -590,8 +590,23 @@ SmsMod* byId(const std::string& id)
 void discover()
 {
 	std::vector<std::string> roots;
-	if (const char* d = getenv("SMS_NATIVE_MODS_DIR"))
-		roots = splitList(d);
+	if (const char* d = getenv("SMS_NATIVE_MODS_DIR")) {
+		// folders, split at ';' only: their paths may have spaces ("SMS Launcher")
+		std::string cur;
+		for (const char* c = d;; c++) {
+			if (*c == ';' || !*c) {
+				while (!cur.empty() && (cur.back() == ' ' || cur.back() == '\t'))
+					cur.pop_back();
+				if (!cur.empty())
+					roots.push_back(cur);
+				cur.clear();
+				if (!*c)
+					break;
+			} else if (!cur.empty() || (*c != ' ' && *c != '\t')) {
+				cur += *c;
+			}
+		}
+	}
 	else
 		for (const char* r : {"mods", "../../mods"})
 			if (isDir(r)) {
@@ -872,11 +887,55 @@ const char* apiAreaName(int area)
 
 int apiInCube(int set, int index, const SmsVec3* p) { return p ? modg_in_cube(set, index, p->x, p->y, p->z) : -1; }
 
+int apiObjectCount(uint32_t lo, uint32_t hi, const char* kind) { return mpg_objects(lo, hi, kind, -1, nullptr); }
+
+int apiObjectInfo(uint32_t lo, uint32_t hi, const char* kind, int index, SmsObjectInfo* out)
+{
+	MpgObjectInfo o;
+	if (!out || index < 0 || !mpg_objects(lo, hi, kind, index, &o))
+		return 0;
+	SmsObjectInfo s;
+	memset(&s, 0, sizeof s);
+	s.size = sizeof s;
+	s.type = o.type;
+	snprintf(s.kind, sizeof s.kind, "%s", o.kind);
+	s.position = {o.position[0], o.position[1], o.position[2]};
+	s.rotation = {o.rotation[0], o.rotation[1], o.rotation[2]};
+	s.scale    = {o.scale[0], o.scale[1], o.scale[2]};
+	s.alive    = o.alive;
+	s.hidden   = o.hidden;
+	s.spawned  = o.spawned;
+	const uint32_t n = out->size && out->size < sizeof s ? out->size : (uint32_t)sizeof s;
+	memcpy(out, &s, n);
+	out->size = n;
+	return 1;
+}
+
+int apiGround(const SmsVec3* p, SmsGround* out)
+{
+	MpgGround g;
+	if (!p || !out || !mpg_ground(p->x, p->y, p->z, &g))
+		return 0;
+	SmsGround s;
+	memset(&s, 0, sizeof s);
+	s.size       = sizeof s;
+	s.floor      = g.floor;
+	s.floor_type = g.floorType;
+	s.water      = g.water;
+	s.has_water  = g.hasWater;
+	s.water_y    = g.waterY;
+	s.roof       = g.roof;
+	const uint32_t n = out->size && out->size < sizeof s ? out->size : (uint32_t)sizeof s;
+	memcpy(out, &s, n);
+	out->size = n;
+	return 1;
+}
+
 const SmsGameApi s_game = {
 	sizeof(SmsGameApi), apiState,        modg_flag_get,       modg_flag_set,         apiCoins,
 	apiLives,           apiShines,       apiBlueCoins,        apiHasShine,           modg_warp,
 	modg_find_object,   modg_object_name, modg_object_position, modg_object_set_position, apiAreaName,
-	modg_cube_count,    apiInCube,
+	modg_cube_count,    apiInCube,       apiObjectCount,      apiObjectInfo,         apiGround,
 };
 
 int apiPlayerGet(SmsPlayer* out)
@@ -1002,6 +1061,11 @@ int apiNetPlayer(int slot, SmsNetPlayer* out)
 			p.flags    = (p.server ? 0 : SMS_NETP_VISIBLE) | (me.on_yoshi ? SMS_NETP_YOSHI : 0);
 		}
 		p.in_stage = mpg_role() == MPG_ROLE_HOST ? mpg_player_arrived(slot) : mpg_session() != 0;
+		int8_t stick[4];
+		uint8_t trigger[2];
+		mpg_local_pad(&p.pad.buttons, stick, trigger);
+		p.pad.stick_x = stick[0], p.pad.stick_y = stick[1], p.pad.cstick_x = stick[2], p.pad.cstick_y = stick[3];
+		p.pad.trigger_l = trigger[0], p.pad.trigger_r = trigger[1];
 	} else {
 		MpgPose pose;
 		float age = 0;
@@ -1014,6 +1078,14 @@ int apiNetPlayer(int slot, SmsNetPlayer* out)
 			          | (pose.flags & MPG_POSE_YOSHI ? SMS_NETP_YOSHI : 0)
 			          | (pose.flags & MPG_POSE_SPECTATING ? SMS_NETP_SPECTATING : 0)
 			          | (pose.more & MPG_POSE2_PAUSED ? SMS_NETP_PAUSED : 0) | (pose.flags & MPG_POSE_DEMO ? SMS_NETP_CUTSCENE : 0);
+			if (pose.hasPad) {
+				p.pad.buttons = pose.padButtons;
+				p.pad.stick_x = pose.padStick[0], p.pad.stick_y = pose.padStick[1];
+				p.pad.cstick_x = pose.padStick[2], p.pad.cstick_y = pose.padStick[3];
+				p.pad.trigger_l = pose.padTrigger[0], p.pad.trigger_r = pose.padTrigger[1];
+			} else {
+				p.pad.err = -1; // an older game says nothing of it
+			}
 		}
 		p.in_stage = mpg_role() == MPG_ROLE_HOST ? mpg_player_arrived(slot) : pose.session == mpg_session() && pose.session;
 	}
@@ -1032,10 +1104,12 @@ uint32_t apiNetSend(uint32_t to, const SmsCmd* cmd)
 	MpgCmd c;
 	memset(&c, 0, sizeof c);
 	c.type    = (uint8_t)(cmd->type <= MPG_CMD_LAST ? cmd->type : 0);
-	c.flags   = (uint8_t)(cmd->flags & SMS_CMD_STICKY ? MPG_CMD_STICKY : 0);
+	c.flags   = (uint8_t)((cmd->flags & SMS_CMD_STICKY ? MPG_CMD_STICKY : 0) | (cmd->flags & SMS_CMD_UNSTICK ? MPG_CMD_UNSTICK : 0));
 	c.delayMs = cmd->delay_ms;
 	memcpy(c.i, cmd->i, sizeof c.i);
-	memcpy(c.f, cmd->f, sizeof c.f);
+	memcpy(c.f, cmd->f, sizeof cmd->f);
+	if (cmd->size >= offsetof(SmsCmd, f2) + sizeof cmd->f2) // API 1.4's four more
+		memcpy(c.f + 4, cmd->f2, sizeof cmd->f2);
 	if (cmd->text)
 		snprintf(c.text, sizeof c.text, "%s", cmd->text);
 	if (!c.type) {
@@ -1046,12 +1120,56 @@ uint32_t apiNetSend(uint32_t to, const SmsCmd* cmd)
 }
 
 int apiNetLoadStage(int area, int episode) { return mpg_server_load_stage(area, episode); }
+int apiNetSetLook(int slot, const char* look) { return mpg_role() == MPG_ROLE_HOST && mpg_server_set_look(slot, look); }
+int apiNetLook(int slot, char* out, int size) { return out && size > 0 ? mpg_look(slot, out, size) : 0; }
+int apiNetSetRespawn(int slot, int how, const SmsVec3* p, float yaw)
+{
+	return mpg_role() == MPG_ROLE_HOST && mpg_server_set_respawn(slot, p ? how : 0, p ? p->x : 0, p ? p->y : 0, p ? p->z : 0, yaw);
+}
 void apiNetSetMode(const char* name) { mpg_server_mode(name); }
 void apiNetSetStatus(const char* text) { mpg_server_status(text); }
 
 const SmsNetApi s_netTable = {
 	sizeof(SmsNetApi), apiNetRole, apiNetDedicated, apiNetLocalSlot, apiNetPlayers,  apiNetPlayer,
 	apiNetSession,     apiNetSend, apiNetLoadStage, apiNetSetMode,   apiNetSetStatus,
+	apiNetSetLook,     apiNetLook, apiNetSetRespawn,
+};
+
+// ------------------------------------------------------------------ world (API 1.4)
+//
+// The vanilla game's map of its stages (the game half's tables). Eclipse
+// numbers its stages its own way: nothing there.
+
+bool vanilla() { return !(sms_mod_active && sms_mod_active()); }
+
+int apiWorldAreaKind(int area) { return vanilla() ? modg_world_area_kind(area) : SMS_AREA_NONE; }
+int apiWorldOf(int area) { return vanilla() ? modg_world_of(area) : -1; }
+int apiWorldEpisodeCount(int area) { return vanilla() ? modg_world_episode_count(area) : 0; }
+int apiWorldEpisodeShine(int area, int episode) { return vanilla() ? modg_world_episode_shine(area, episode) : -1; }
+int apiWorldEpisodeName(int area, int episode, char* out, int size)
+{
+	if (out && size > 0)
+		out[0] = 0;
+	return vanilla() ? modg_world_episode_name(area, episode, out, size) : 0;
+}
+int apiWorldNextEpisode(int area) { return vanilla() ? modg_world_next_episode(area) : -1; }
+int apiWorldShineEpisode(int shine, int* area)
+{
+	if (area)
+		*area = -1;
+	return vanilla() ? modg_world_shine_episode(shine, area) : -1;
+}
+int apiWorldHasCutscene(const char* name) { return modg_world_has_cutscene(name); }
+int apiWorldPlayCutscene(const char* name, const SmsVec3* focus, int frames)
+{
+	return modg_world_play_cutscene(name, focus, frames);
+}
+int apiWorldCutscenePlaying(void) { return modg_world_cutscene_playing(); }
+
+const SmsWorldApi s_world = {
+	sizeof(SmsWorldApi),  apiWorldAreaKind,     apiWorldOf,          apiWorldEpisodeCount,
+	apiWorldEpisodeShine, apiWorldEpisodeName,  apiWorldNextEpisode, apiWorldShineEpisode,
+	apiWorldHasCutscene,  apiWorldPlayCutscene, apiWorldCutscenePlaying,
 };
 
 // What the multiplayer game says happened, to every mod.
@@ -1427,7 +1545,7 @@ namespace modhost {
 const SmsApi g_api = {
 	sizeof(SmsApi), SMS_MOD_API_MAJOR, SMS_MOD_API_MINOR, &s_core,   &s_game,  &s_player,
 	&s_camera,      &g_drawApi,        &s_input,          &s_config, &s_audio, &s_native,
-	&s_netTable,
+	&s_netTable,    &s_world,
 };
 
 void log(SmsMod* mod, int level, const char* fmt, ...)

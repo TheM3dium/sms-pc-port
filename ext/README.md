@@ -41,6 +41,7 @@ An extension fills in a `PortExtension` with the hooks it needs, leaving the res
 | `playerDamage` | `TMario::decHP` | change the amount, or return 1 to stop it |
 | `shineCollected` | `TFlagManager::setShineFlag` sets a Shine's flag for the first time | note it |
 | `savePrompt` | the stage is about to ask the player to save, after a Shine, a blue coin, a nozzle's box or Yoshi (not a game over's) | return 1 to leave the prompt out (auto save saves instead) |
+| `chooseNextStage` | `TMarDirector::moveStage` is about to leave, before any extension's `moveStage` | change the destination, which every `moveStage` then sees (multiplayer's host sends the players where its mods chose) |
 
 Every hook runs on the game thread inside the game's own steps, so an extension uses the game's globals (`gpApplication`, `gpMarDirector`, `gpMarioOriginal`, `TFlagManager`) as the game does there.
 With no extension switched on, each hook is a loop over nothing.

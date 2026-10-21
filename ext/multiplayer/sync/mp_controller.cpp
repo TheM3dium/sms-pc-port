@@ -113,6 +113,15 @@ struct Controller {
 	// looksVersion counts their changes, for puppets to paint again
 	std::string looks[MP_MAX_PLAYERS];
 	std::string myLook;
+	// host: a server mod's forced looks (set_look), and what each player's
+	// game said theirs is, for when the forced one goes
+	bool lookForced[MP_MAX_PLAYERS] = {};
+	std::string reportedLook[MP_MAX_PLAYERS];
+	// host: where each player comes back as they arrive (a server mod's)
+	struct Respawn {
+		int how = 0; // 0 the stage's own, 1 a warp, 2 onto a Blooper
+		float x = 0, y = 0, z = 0, yaw = 0;
+	} respawn[MP_MAX_PLAYERS];
 	uint32_t looksVersion = 0;
 	MpgGame game{};
 	bool wasPlaying = false;
@@ -336,10 +345,10 @@ void netEvent(int type, int slot, const char* name)
 }
 
 // A command as sent: its type, flags, delay, four whole numbers and four
-// others, and its text.
+// others, its text, and four more others (API 1.4: after what older games read).
 std::vector<uint8_t> cmdMessage(const MpgCmd& c, uint32_t delayMs)
 {
-	std::vector<uint8_t> buf(14 + 32 + 1 + MPG_CMD_TEXT);
+	std::vector<uint8_t> buf(14 + 32 + 1 + MPG_CMD_TEXT + 16);
 	Writer w(buf.data(), buf.size());
 	w.u8(c.type);
 	w.u8(c.flags);
@@ -349,6 +358,8 @@ std::vector<uint8_t> cmdMessage(const MpgCmd& c, uint32_t delayMs)
 	for (int k = 0; k < 4; k++)
 		w.f32(c.f[k]);
 	w.str(c.text, MPG_CMD_TEXT - 1);
+	for (int k = 4; k < 8; k++)
+		w.f32(c.f[k]);
 	buf.resize(w.len);
 	return buf;
 }
@@ -364,7 +375,10 @@ bool readCmd(Reader& r, MpgCmd* c)
 	for (int k = 0; k < 4; k++)
 		c->f[k] = r.f32();
 	r.str(c->text, sizeof c->text);
-	for (int k = 0; k < 4; k++)
+	if (r.ok && r.left() >= 16)
+		for (int k = 4; k < 8; k++)
+			c->f[k] = r.f32();
+	for (int k = 0; k < 8; k++)
 		if (c->f[k] != c->f[k])
 			return false; // no NaNs into the game
 	return r.ok && c->type >= 1 && c->type <= MPG_CMD_LAST;
@@ -387,16 +401,39 @@ void sendCmd(int slot, const MpgCmd& c, uint32_t delayMs)
 }
 
 // What a sticky command replaces: one of its kind to the same players (for
-// actors, the same types; for a script, the same script).
+// actors, the same types; for a script, the same script; for an object, the
+// same object and what is done to it).
 uint64_t stickyKey(const MpgCmd& c, uint32_t to)
 {
 	uint64_t sub = 0;
-	if (c.type == MPG_CMD_ACTORS)
+	if (c.type == MPG_CMD_ACTORS || c.type == MPG_CMD_OBJECT)
 		sub = (uint64_t)(uint32_t)c.i[0] * 31 + (uint32_t)c.i[1];
-	else if (c.type == MPG_CMD_STOP_SCRIPT)
+	if (c.type == MPG_CMD_OBJECT) // shown and hidden are one: the last says which
+		sub = (sub * 131 + (uint32_t)c.i[2]) * 131 + (uint32_t)(c.i[3] == MPG_OBJECT_SHOW ? MPG_OBJECT_HIDE : c.i[3]);
+	if (c.type == MPG_CMD_STOP_SCRIPT || c.type == MPG_CMD_OBJECT)
 		for (const char* t = c.text; *t; t++)
 			sub = sub * 131 + (uint8_t)*t;
+	if (c.type == MPG_CMD_SPAWN) // each copy its own (its id)
+		sub = (uint32_t)c.i[3];
+	if (c.type == MPG_CMD_PLAYER || c.type == MPG_CMD_BOARD || c.type == MPG_CMD_MARKER) // what, the row, the marker
+		sub = (uint32_t)c.i[0];
 	return ((uint64_t)c.type << 56) ^ ((uint64_t)to << 48) ^ (sub & 0xFFFFFFFFFFFFull);
+}
+
+// Where a server mod has a player come back, after the session's sticky
+// commands (which came first): a warp, or onto a Blooper there.
+void sendRespawn(int slot)
+{
+	const Controller::Respawn& r = g.respawn[slot];
+	if (r.how != 1 && r.how != 2)
+		return;
+	MpgCmd c;
+	memset(&c, 0, sizeof c);
+	c.type = r.how == 1 ? MPG_CMD_WARP : MPG_CMD_MOUNT;
+	c.i[0] = 0x400000C5; // the Bloopers: red, yellow, green
+	c.i[1] = 0x400000C7;
+	c.f[0] = r.x, c.f[1] = r.y, c.f[2] = r.z, c.f[3] = r.yaw;
+	sendCmd(slot, c, 0);
 }
 
 // The session's sticky commands, again, for a player arriving in it.
@@ -919,8 +956,11 @@ void hostMessage(const MpEvent& ev)
 	case K_LOOK: {
 		r.u8(); // a client speaks for itself only
 		const std::string look = readLook(r);
-		if (!r.ok)
+		if (!r.ok || ev.slot < 0 || ev.slot >= MP_MAX_PLAYERS)
 			break;
+		g.reportedLook[ev.slot] = look;
+		if (g.lookForced[ev.slot])
+			break; // a server mod's look stands
 		setLook(ev.slot, look);
 		send(-1, K_LOOK, lookMessage(ev.slot, look));
 		break;
@@ -942,6 +982,7 @@ void hostMessage(const MpEvent& ev)
 			if (ev.slot > 0 && ev.slot < MP_MAX_PLAYERS) {
 				g.readySession[ev.slot] = s;
 				replaySticky(ev.slot);
+				sendRespawn(ev.slot);
 				char name[MP_NAME_LEN];
 				mp_player_name(ev.slot, name, sizeof name);
 				netEvent(MPG_NET_ARRIVED, ev.slot, name);
@@ -1154,9 +1195,11 @@ void clientMessage(const MpEvent& ev)
 		break;
 	}
 	case K_LOOK: {
+		// any player's, ours too (as the host passes ours back, or a server
+		// mod's for us); the host has the say
 		const int slot         = r.u8();
 		const std::string look = readLook(r);
-		if (r.ok && slot != mp_local_slot())
+		if (r.ok)
 			setLook(slot, look);
 		break;
 	}
@@ -1267,6 +1310,11 @@ void events()
 		case MP_EV_PLAYER_JOINED:
 			notice(std::string(ev.name[0] ? ev.name : "A player") + " joined as " + kCharacters[characterOf(ev.slot)]);
 			setLook(ev.slot, ""); // theirs comes next
+			if (ev.slot >= 0 && ev.slot < MP_MAX_PLAYERS) {
+				g.lookForced[ev.slot] = false; // a new player in the slot
+				g.reportedLook[ev.slot].clear();
+				g.respawn[ev.slot] = Controller::Respawn();
+			}
 			netEvent(MPG_NET_JOINED, ev.slot, ev.name);
 			if (g.role == MPG_ROLE_HOST) {
 				g.readySession[ev.slot] = 0;
@@ -1322,6 +1370,7 @@ void events()
 
 // An effect as sent: 10 bytes, 14 with a turn.
 const size_t kFxBytes = 14;
+const size_t kPadBytes = 8; // what the player presses, at a pose's end
 bool fxTurns(const MpgFx& f) { return f.how == 1 || (f.how >= 3 && f.bind == MPG_FX_BIND_NONE); }
 void writeFx(Writer& w, const MpgFx& f)
 {
@@ -1411,9 +1460,9 @@ void packPose(const MpgPose& p, std::vector<uint8_t>& out)
 	// the effects going on first (they show for as long as they are sent),
 	// then the newest of those asked for once (each is in a few poses)
 	int fx = std::min<int>(p.fxCount, MPG_MAX_FX), shots = std::min<int>(p.shotCount, MPG_MAX_FX);
-	while (fx > 0 && w.len + 3 + fx * kFxBytes > kPoseSize)
+	while (fx > 0 && w.len + 3 + fx * kFxBytes + kPadBytes > kPoseSize)
 		fx--;
-	while (shots > 0 && w.len + 3 + fx * kFxBytes + shots * kFxBytes > kPoseSize)
+	while (shots > 0 && w.len + 3 + fx * kFxBytes + shots * kFxBytes + kPadBytes > kPoseSize)
 		shots--;
 	w.u8((uint8_t)fx);
 	for (int i = 0; i < fx; i++)
@@ -1422,6 +1471,12 @@ void packPose(const MpgPose& p, std::vector<uint8_t>& out)
 	w.u8(p.shotSeq);
 	for (int i = p.shotCount - shots; i < p.shotCount; i++) // the newest
 		writeFx(w, p.shots[i]);
+	// what they press (API 1.4), last: older games stop before it
+	w.u16(p.padButtons);
+	for (int i = 0; i < 4; i++)
+		w.u8((uint8_t)p.padStick[i]);
+	w.u8(p.padTrigger[0]);
+	w.u8(p.padTrigger[1]);
 	out.resize(w.len);
 }
 
@@ -1489,6 +1544,14 @@ bool unpackPose(const uint8_t* d, size_t n, MpgPose& p)
 		return false;
 	for (int i = 0; i < p.shotCount; i++)
 		readFx(r, p.shots[i]);
+	p.hasPad = r.ok && r.left() >= kPadBytes;
+	if (p.hasPad) {
+		p.padButtons = r.u16();
+		for (int i = 0; i < 4; i++)
+			p.padStick[i] = (int8_t)r.u8();
+		p.padTrigger[0] = r.u8();
+		p.padTrigger[1] = r.u8();
+	}
 	return r.ok;
 }
 
@@ -1726,6 +1789,16 @@ extern "C" uint32_t mpg_server_send(uint32_t to, const MpgCmd* cmd)
 	std::lock_guard<std::mutex> hold(g_lock);
 	MpgCmd c = *cmd;
 	c.text[MPG_CMD_TEXT - 1] = 0;
+	if (c.flags & MPG_CMD_UNSTICK) {
+		// the sticky command of this kind forgotten: newcomers get it no more
+		const uint64_t key = stickyKey(c, to);
+		for (size_t k = 0; k < g.sticky.size(); k++)
+			if (g.sticky[k].key == key) {
+				g.sticky.erase(g.sticky.begin() + (long)k);
+				return 1;
+			}
+		return 0;
+	}
 	const unsigned players = mp_players() | 1u; // the host's own game is slot 0
 	uint32_t sent = 0;
 	for (int i = 0; i < MP_MAX_PLAYERS; i++) {
@@ -1748,7 +1821,7 @@ extern "C" uint32_t mpg_server_send(uint32_t to, const MpgCmd* cmd)
 				g.sticky.erase(g.sticky.begin() + (long)k);
 				break;
 			}
-		if (g.sticky.size() >= 64)
+		if (g.sticky.size() >= 192) // room for a stage's objects, each with its own (MPG_CMD_OBJECT)
 			g.sticky.erase(g.sticky.begin());
 		g.sticky.push_back({key, to, kept});
 	}
@@ -1939,6 +2012,8 @@ extern "C" void mpg_frame(const MpgGame* game)
 		if (arrived && g.session) {
 			g.readySession[0] = g.session;
 			replaySticky(0);
+			if (!g_dedicated)
+				sendRespawn(0);
 			if (!g_dedicated) {
 				char name[MP_NAME_LEN];
 				mp_player_name(0, name, sizeof name);
@@ -2570,6 +2645,35 @@ extern "C" int mpg_pose(int slot, MpgPose* pose, float* age)
 }
 
 extern "C" uint32_t mpg_looks_version(void) { return g.looksVersion; }
+
+extern "C" int mpg_server_set_look(int slot, const char* look)
+{
+	std::lock_guard<std::mutex> hold(g_lock);
+	if (g.role != MPG_ROLE_HOST || slot < 0 || slot >= MP_MAX_PLAYERS || !(mp_players() & (1u << slot) || slot == 0))
+		return 0;
+	g.lookForced[slot] = look != nullptr;
+	const std::string now = look ? cleanLook(look, strlen(look)) : slot == 0 ? g.myLook : g.reportedLook[slot];
+	setLook(slot, now);
+	send(-1, K_LOOK, lookMessage(slot, now));
+	return 1;
+}
+
+extern "C" int mpg_own_look_forced(void)
+{
+	const int me = mp_local_slot();
+	return g.role != MPG_ROLE_OFF && me >= 0 && me < MP_MAX_PLAYERS && g.looks[me] != g.myLook;
+}
+
+extern "C" int mpg_server_set_respawn(int slot, int how, float x, float y, float z, float yaw)
+{
+	std::lock_guard<std::mutex> hold(g_lock);
+	if (g.role != MPG_ROLE_HOST || slot < 0 || slot >= MP_MAX_PLAYERS)
+		return 0;
+	Controller::Respawn& r = g.respawn[slot];
+	r.how = how == 1 || how == 2 ? how : 0;
+	r.x = x, r.y = y, r.z = z, r.yaw = yaw;
+	return 1;
+}
 
 extern "C" int mpg_look(int slot, char* out, int size)
 {

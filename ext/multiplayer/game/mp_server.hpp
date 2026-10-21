@@ -5,6 +5,8 @@
 
 class TMarDirector;
 class TMpPuppet;
+class TLiveActor;
+struct MpgCmd;
 
 // mp_game.cpp's, for the commands
 TMpPuppet* MpPuppet(int slot);
@@ -32,5 +34,19 @@ bool MpServerDedicated();
 const char* MpServerStatusLine();
 // Host, after the file select: a stage a server mod asked for instead (1).
 int MpServerAfterFileSelect();
+// MPG_RULE_NO_DAMAGE in force: this game's player loses no health.
+int MpServerNoDamage();
+// The game camera's eye and the point it looks at, about to be used: shaken (MPG_CMD_SHAKE).
+void MpServerCamera(float* eye, float* at);
+
+// mp_spawn.cpp: MPG_CMD_SPAWN's copies of the stage's objects and its items.
+// The stage's records (scene.bin), as its loader made each object from one.
+void MpSpawnRecord(void* object, const void* record, unsigned size);
+void MpSpawnStageSetup();
+void MpSpawn(const MpgCmd& c);
+// The copy with that id (MPG_CMD_SPAWN's i[3]), or null.
+TLiveActor* MpSpawned(int id);
+// Its id, or 0: the stage's own.
+int MpSpawnedId(const TLiveActor* actor);
 
 #endif

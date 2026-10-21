@@ -108,6 +108,10 @@ typedef struct PortExtension {
 	// good, 5 Yoshi hatched, 6 a Shine. Return 1 to leave the prompt out (the
 	// extension saved, or the game need not); the stage goes on as after it.
 	int (*savePrompt)(int kind);
+	// TMarDirector::moveStage is about to leave for gpApplication.mNextArea,
+	// which the hook may change: every extension's chooseNextStage runs
+	// before any extension's moveStage, so those see where the game goes.
+	void (*chooseNextStage)(void);
 } PortExtension;
 
 // Adds an extension; call from a static constructor or before the first frame.
