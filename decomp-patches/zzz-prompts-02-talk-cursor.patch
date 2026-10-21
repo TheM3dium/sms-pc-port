@@ -1,0 +1,120 @@
+Reason: port: with button prompts (SMS_BUTTON_PROMPTS), the talk cursor over an NPC shows the B button of the controller in use (port_button_glyph) in place of the GameCube B
+--- a/src/System/TalkCursor.cpp
++++ b/src/System/TalkCursor.cpp
+@@ -7,6 +7,90 @@
+ // rogue
+ #include <M3DUtil/InfectiousStrings.hpp>
+ 
++#ifdef TARGET_PC
++#include <JSystem/J3D/J3DGraphBase/J3DShape.hpp>
++#include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
++#include <dolphin/gx.h>
++#include <dolphin/mtx.h>
++#include <math.h>
++
++// Button prompts (platform gx_prompts.cpp): an RGBA8 64x64 image of the B
++// button in the style of the controller in use, or null for the game's own.
++extern "C" const void* port_button_glyph(int chr);
++
++// The cursor's model (/common/cursor_b) is a B button face, shape 0 on joint
++// 2, over a spinning gem. The face's material adds a white B over a red disc,
++// so a picture swapped into either texture cannot show another button's
++// colours. With a prompt style, the face is hidden and the prompt is drawn in
++// its place instead: a square the face's size (80 units) turned to the
++// camera, over everything like the face (Z compare always, no update).
++static const f32 cTalkCursorFaceHalf = 40.13569f;
++
++static void TalkCursorDrawPrompt(J3DModel* model, const void* image)
++{
++	MtxPtr world = model->getAnmMtx(2);
++	Vec pos      = { world[0][3], world[1][3], world[2][3] };
++	Vec view;
++	MTXMultVec(j3dSys.getViewMtx(), &pos, &view);
++	f32 scale = sqrtf(world[0][0] * world[0][0] + world[1][0] * world[1][0]
++	                  + world[2][0] * world[2][0]);
++	Mtx mtx;
++	MTXScale(mtx, scale, scale, scale);
++	mtx[0][3] = view.x;
++	mtx[1][3] = view.y;
++	mtx[2][3] = view.z;
++	GXLoadPosMtxImm(mtx, GX_PNMTX0);
++	GXSetCurrentMtx(GX_PNMTX0);
++
++	GXTexObj tex;
++	GXInitTexObj(&tex, (void*)image, 64, 64, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP,
++	             GX_FALSE);
++	GXInitTexObjLOD(&tex, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE,
++	                GX_FALSE, GX_ANISO_1);
++	GXLoadTexObj(&tex, GX_TEXMAP0);
++
++	GXSetNumChans(1);
++	GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_REG, GX_SRC_REG, 0, GX_DF_NONE,
++	              GX_AF_NONE);
++	GXSetChanMatColor(GX_COLOR0A0, (GXColor) { 255, 255, 255, 255 });
++	GXSetNumTexGens(1);
++	GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
++	GXSetNumIndStages(0);
++	GXSetNumTevStages(1);
++	GXSetTevDirect(GX_TEVSTAGE0);
++	GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
++	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
++	GXSetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
++	GXSetTevSwapModeTable(GX_TEV_SWAP0, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE,
++	                      GX_CH_ALPHA);
++	GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f,
++	         (GXColor) { 0, 0, 0, 0 });
++	GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA,
++	               GX_LO_CLEAR);
++	GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
++	GXSetZCompLoc(GX_TRUE);
++	GXSetZMode(GX_TRUE, GX_ALWAYS, GX_FALSE);
++	GXSetCullMode(GX_CULL_NONE);
++
++	GXClearVtxDesc();
++	GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
++	GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
++	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
++	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
++	const f32 r = cTalkCursorFaceHalf;
++	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
++	GXPosition3f32(-r, r, 0.0f);
++	GXTexCoord2f32(0.0f, 0.0f);
++	GXPosition3f32(r, r, 0.0f);
++	GXTexCoord2f32(1.0f, 0.0f);
++	GXPosition3f32(r, -r, 0.0f);
++	GXTexCoord2f32(1.0f, 1.0f);
++	GXPosition3f32(-r, -r, 0.0f);
++	GXTexCoord2f32(0.0f, 1.0f);
++	GXEnd();
++}
++#endif
++
+ // The 8 bytes of low region retail has here are one inline expansion: reading
+ // `unk10` through a level that binds its result. Header round 20 promoted that
+ // level to `TTalkCursor::getMActor()` in the header (codegen-identical to the
+@@ -45,7 +129,25 @@
+ 	if (cue & CUE_DRAW) {
+ 		GXSetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+ 	} else {
++#ifdef TARGET_PC
++		// the prompt in place of the B face (TalkCursorDrawPrompt); the face's
++		// visibility bit is set to hide it (J3DJoint::entryIn skips such shapes)
++		const void* prompt = nullptr;
++		if (cue & CUE_ENTRY) {
++			prompt = port_button_glyph('#');
++			J3DShape* face
++			    = unk10->getModel()->getModelData()->getShapeNodePointer(0);
++			if (prompt)
++				face->onFlag(J3DShpFlag_Visible);
++			else
++				face->offFlag(J3DShpFlag_Visible);
++		}
++#endif
+ 		unk10->perform(cue, graphics);
++#ifdef TARGET_PC
++		if (prompt)
++			TalkCursorDrawPrompt(unk10->getModel(), prompt);
++#endif
+ 	}
+ }
+ 
