@@ -4,7 +4,8 @@
     python3 tools/mods/get.py textures    the Super Mario Sunshine UHD Texture Pack, and the extras
     python3 tools/mods/get.py extras      only the extras: HD textures the UHD pack lacks
                                           (--if-outdated: only if not the pinned release)
-    python3 tools/mods/get.py eclipse     Super Mario Eclipse (patched from your disc), and its maps
+    python3 tools/mods/get.py eclipse     Super Mario Eclipse (patched from your disc), and its maps;
+                                          --eclipse-iso or --archive to use a file you have
     python3 tools/mods/get.py eclipse-maps  only the radar's maps of Eclipse's stages;
                                           --if-outdated as for extras
     python3 tools/mods/get.py language fr the game's text in French (de, es, it, pl: German,
@@ -22,6 +23,12 @@ Options:
                       unmodified 1:1 ISO), for Eclipse; by default the one
                       named by SMS_DISC_IMAGE or disc_image in settings.txt,
                       or the one in rom/
+    --eclipse-iso PATH  for Eclipse: the Super Mario Eclipse v1.1.0 image you
+                      already have (made by Eclipse's own patcher, or by this
+                      script), checked and used instead of downloading
+    --archive PATH    for Eclipse: the release you downloaded yourself
+                      (super_mario_eclipse_v110.7z from GameBanana), checked
+                      and used instead of downloading it; still needs --iso
     --keep-download   keep the downloaded archives in mods/.downloads/
 
 Needs Python 3 and 7-Zip (7z, 7zz or 7za on PATH).
@@ -480,29 +487,105 @@ def get_eclipse_maps(keep, if_outdated=False):
         % (count, os.path.relpath(mod["install"], ROOT)))
 
 
-def get_eclipse(keep, iso_arg):
+def inside(path, folder):
+    path, folder = os.path.realpath(path), os.path.realpath(folder)
+    try:
+        return os.path.commonpath([path, folder]) == folder
+    except ValueError:  # on another Windows drive
+        return False
+
+
+# An Eclipse image you already have: the one Eclipse's own patcher makes from
+# the same disc is this script's result, byte for byte, so its MD5 says it is.
+# It is linked into mods/eclipse when it is on the same drive (no space taken),
+# or copied, or moved when it is in mods/eclipse already under another name.
+def import_eclipse_iso(path):
+    mod = ECLIPSE
+    if not os.path.isfile(path):
+        raise Failure("no such image: %s" % path)
+    say("Checking your Eclipse image, %s" % path)
+    got = md5_of(path)
+    if got == mod["source_md5"]:
+        raise Failure("that is your Super Mario Sunshine disc, not Super Mario Eclipse: install Eclipse"
+                      " from it with --iso instead")
+    if got != mod["result_md5"]:
+        raise Failure("that is not the image of %s (MD5 %s, expected %s): only that release, as Eclipse's"
+                      " own patcher makes it from the North American disc, works; compressed or trimmed"
+                      " images such as CISO, NKit and RVZ do not" % (mod["name"], got, mod["result_md5"]))
+    out = os.path.join(mod["install"], mod["iso"])
+    if os.path.exists(out) and os.path.samefile(path, out):
+        say("It is the installed image already.")
+        return out
+    if os.path.isdir(mod["install"]) and inside(path, mod["install"]):
+        # Put there by hand under another name: the rest of the folder stays.
+        os.replace(path, out)
+        say("Renamed it to %s." % os.path.relpath(out, ROOT))
+        return out
+    if os.path.lexists(mod["install"]):
+        say("Removing the previous install, %s" % os.path.relpath(mod["install"], ROOT))
+        remove(mod["install"])
+    os.makedirs(mod["install"])
+    part = out + ".part"
+    try:
+        try:
+            os.link(path, part)
+            say("Linked it into %s (it takes no more space)." % os.path.relpath(mod["install"], ROOT))
+        except OSError:
+            need_space(mod["install"], os.path.getsize(path) + (64 << 20))
+            say("Copying it into %s" % os.path.relpath(mod["install"], ROOT))
+            shutil.copyfile(path, part)
+        os.replace(part, out)
+    except BaseException:
+        remove(mod["install"])
+        raise
+    return out
+
+
+def get_eclipse(keep, iso_arg, eclipse_iso=None, archive_arg=None):
     mod = ECLIPSE
     say("== Eclipse: %s" % mod["name"])
+    if eclipse_iso:
+        out = import_eclipse_iso(eclipse_iso)
+        say("Installed %s." % os.path.relpath(out, ROOT))
+        get_eclipse_maps_after(keep)
+        return
     seven_zip()
     iso = find_iso(iso_arg)
     if not os.path.isfile(iso):
         raise Failure("no such image: %s" % iso)
     say("Checking your image, %s" % iso)
     got = md5_of(iso)
+    if got == mod["result_md5"]:
+        raise Failure("that is Super Mario Eclipse already, not your Super Mario Sunshine disc:"
+                      " install it with --eclipse-iso instead")
     if got != mod["source_md5"]:
         raise Failure("Eclipse patches only the North American ISO with MD5 %s, and this one is %s"
                       " (compressed or trimmed images such as CISO, NKit and RVZ do not work)"
                       % (mod["source_md5"], got))
+    if archive_arg:
+        # The release you downloaded yourself: checked like a download, and
+        # never deleted, since it is yours.
+        if not os.path.isfile(archive_arg):
+            raise Failure("no such file: %s" % archive_arg)
+        say("Checking your Eclipse download, %s" % archive_arg)
+        got = md5_of(archive_arg)
+        if got != mod["md5"]:
+            raise Failure("that is not the release of %s (%s from %s): MD5 %s, expected %s"
+                          % (mod["name"], mod["file"], mod["page"], got, mod["md5"]))
+        if inside(archive_arg, mod["install"]):
+            raise Failure("move %s out of %s first: installing Eclipse replaces that folder"
+                          % (archive_arg, os.path.relpath(mod["install"], ROOT)))
     if os.path.isdir(mod["install"]):
         say("Removing the previous install, %s" % os.path.relpath(mod["install"], ROOT))
         remove(mod["install"])
-    need_space(MODS, mod["size"] + mod["patch_size"] + os.path.getsize(iso) + (64 << 20))
-    archive = fetch(mod)
+    need_space(MODS, (0 if archive_arg else mod["size"]) + mod["patch_size"] + os.path.getsize(iso) + (64 << 20))
+    archive = archive_arg or fetch(mod)
+    drop = not keep and not archive_arg  # the download, once used
     tmp = os.path.join(DOWNLOADS, "eclipse")
     out = os.path.join(mod["install"], mod["iso"])
     try:
         extract(archive, tmp, [mod["patch"], "readme.md", "changelog.md", "license.md"])
-        if not keep:
+        if drop:
             remove(archive)
         os.makedirs(mod["install"])
         say("Patching your image (a minute or two)")
@@ -535,11 +618,15 @@ def get_eclipse(keep, iso_arg):
         raise
     finally:
         remove(tmp)
-        if not keep:
+        if drop:
             remove(archive)
     say("Installed %s." % os.path.relpath(out, ROOT))
     say("It is the same image Eclipse's own patcher makes, for Dolphin or a console. The port"
         " plays it with Eclipse's code built in: SMS_ECLIPSE=1 ./build.sh (docs/ECLIPSE.md).")
+    get_eclipse_maps_after(keep)
+
+
+def get_eclipse_maps_after(keep):
     try:
         get_eclipse_maps(keep)
     except Failure as e:
@@ -554,6 +641,8 @@ def main():
     ap.add_argument("what", choices=["textures", "extras", "eclipse", "eclipse-maps", "language", "lua", "all"])
     ap.add_argument("language", nargs="?", help="with language: fr, de, es, it or pl")
     ap.add_argument("--iso")
+    ap.add_argument("--eclipse-iso")
+    ap.add_argument("--archive")
     ap.add_argument("--keep-download", action="store_true")
     ap.add_argument("--if-outdated", action="store_true")
     args = ap.parse_args()
@@ -577,7 +666,7 @@ def main():
         if args.what == "eclipse-maps":
             get_eclipse_maps(args.keep_download, args.if_outdated)
         if args.what in ("eclipse", "all"):
-            get_eclipse(args.keep_download, args.iso)
+            get_eclipse(args.keep_download, args.iso, args.eclipse_iso, args.archive)
     except Failure as e:
         sys.exit("error: %s" % e)
     except KeyboardInterrupt:

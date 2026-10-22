@@ -30,6 +30,7 @@ Much of BSE's own patching is features the port has or does not need (60 fps, 16
 
 ```sh
 python3 tools/mods/get.py eclipse          # the Eclipse ISO, mods/eclipse/Super Mario Eclipse v1.1.0.iso
+# or, with an Eclipse v1.1.0 ISO you already have: get.py eclipse --eclipse-iso PATH
 cmake -S . -B build-ecl -DSMS_ARCH=32 -DSMS_ECLIPSE=ON     # or -DSMS_ARCH=64
 cmake --build build-ecl
 SMS_DISC_IMAGE="mods/eclipse/Super Mario Eclipse v1.1.0.iso" build-ecl/sms
