@@ -17,7 +17,14 @@
 #include "gx_internal.h"
 
 #include <algorithm>
+#if defined(__APPLE__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101500
+// macOS before 10.15 has no std::filesystem: subfolders() uses POSIX.
+#define SMS_RADAR_POSIX_FS 1
+#include <dirent.h>
+#include <sys/stat.h>
+#else
 #include <filesystem>
+#endif
 #include <mutex>
 #include <stdint.h>
 #include <stdio.h>
@@ -65,6 +72,29 @@ int s_ow, s_oh;
 const int kOverview = 1536;
 bool s_loading;
 
+// The names of base's folders; false if base is not a folder.
+bool subfolders(const std::string& base, std::vector<std::string>* names) {
+#if SMS_RADAR_POSIX_FS
+    DIR* d = opendir(base.c_str());
+    if (!d) return false;
+    while (struct dirent* e = readdir(d)) {
+        struct stat st;
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") &&
+            stat((base + "/" + e->d_name).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            names->push_back(e->d_name);
+    }
+    closedir(d);
+    return true;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(base, ec)) return false;
+    for (fs::directory_iterator it(base, ec), end; !ec && it != end; it.increment(ec))
+        if (it->is_directory(ec)) names->push_back(it->path().filename().string());
+    return true;
+#endif
+}
+
 bool readable(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (f) fclose(f);
@@ -106,13 +136,9 @@ void init() {
     }
     if (!found) gx::logmsg("radar: no stage maps (assets/maps/maps.txt; SMS_RADAR_DIR sets the folder)");
     // the mods' packs, from the first mods/maps there is
-    namespace fs = std::filesystem;
     for (const char* base : {"mods/maps", "../../mods/maps"}) {
-        std::error_code ec;
-        if (!fs::is_directory(base, ec)) continue;
         std::vector<std::string> packs;
-        for (fs::directory_iterator it(base, ec), end; !ec && it != end; it.increment(ec))
-            if (it->is_directory(ec)) packs.push_back(it->path().filename().string());
+        if (!subfolders(base, &packs)) continue;
         std::sort(packs.begin(), packs.end());
         for (const std::string& p : packs) {
             const std::string dir = std::string(base) + "/" + p;

@@ -1,0 +1,29 @@
+--- a/src/video/cocoa/SDL_cocoawindow.m
++++ b/src/video/cocoa/SDL_cocoawindow.m
+@@ -743,16 +743,21 @@
+     SDL_SendWindowEvent(_data.window, SDL_WINDOWEVENT_EXPOSED, 0, 0);
+ }
+ 
++- (void)liveResizeTimerFired:(NSTimer *)unusedTimer
++{
++    SDL_OnWindowLiveResizeUpdate(_data.window);
++}
++
+ - (void)windowWillStartLiveResize:(NSNotification *)aNotification
+ {
+     // We'll try to maintain 60 FPS during live resizing
+     const NSTimeInterval interval = 1.0 / 60.0;
++    /* The target/selector form: the block form needs macOS 10.12. */
+     liveResizeTimer = [NSTimer scheduledTimerWithTimeInterval:interval
+-                                                      repeats:TRUE
+-                                                        block:^(NSTimer *unusedTimer)
+-    {
+-        SDL_OnWindowLiveResizeUpdate(_data.window);
+-    }];
++                                                       target:self
++                                                     selector:@selector(liveResizeTimerFired:)
++                                                     userInfo:nil
++                                                      repeats:TRUE];
+ 
+     [[NSRunLoop currentRunLoop] addTimer:liveResizeTimer forMode:NSRunLoopCommonModes];
+ }

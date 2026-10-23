@@ -130,11 +130,14 @@ endif()
 # the renderer draws with, on Vulkan. The Vulkan loader is opened at run time
 # (volk), so the game still starts where there is none and falls back to GL.
 # On by default on Linux and macOS (MoltenVK), where it is tested;
-# -DSMS_GX_VULKAN=ON on Windows.
+# -DSMS_GX_VULKAN=ON on Windows. Off for macOS before 10.15
+# (CMAKE_OSX_DEPLOYMENT_TARGET), which glslang's std::filesystem needs.
 # Its dependencies are downloaded at configure time (or taken from the
 # tarballs in SMS_GX_VULKAN_DEPS); if one cannot be had, the game is built
 # without the backend, as before it existed, and configure only warns.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 10.15)
+    set(_sms_vulkan_default OFF)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
     set(_sms_vulkan_default ON)
 else()
     set(_sms_vulkan_default OFF)

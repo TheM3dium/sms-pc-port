@@ -35,7 +35,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#if defined(__APPLE__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101500
+// macOS before 10.15 has no std::filesystem: the file helpers below use POSIX.
+#define SMS_HIRES_POSIX_FS 1
+#include <dirent.h>
+#else
 #include <filesystem>
+#endif
 #include <mutex>
 #include <memory>
 #include <string>
@@ -154,11 +160,109 @@ static bool endsWith(const std::string& s, const char* suf) {
     return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
 }
 
-static void indexFile(const std::filesystem::path& p, bool look) {
-    std::string ext = p.extension().string();
-    for (char& c : ext) c = char(tolower(c));
+// The file name's extension in lower case, or "" (as path::extension).
+static std::string lowerExtension(const std::string& path) {
+    size_t slash = path.find_last_of("/\\"), start = slash == std::string::npos ? 0 : slash + 1;
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos || dot <= start) return std::string();
+    std::string ext = path.substr(dot);
+    for (char& c : ext) c = char(tolower(uint8_t(c)));
+    return ext;
+}
+
+#if SMS_HIRES_POSIX_FS
+static bool isDirectory(const std::string& d) {
+    struct stat st;
+    return stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// each(path) for every file under dir, following links, without entering
+// directories named skip.
+template <class F>
+static void forEachFile(const std::string& dir, const char* skip, F&& each) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    while (struct dirent* e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        std::string path = dir + "/" + e->d_name;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (strcmp(e->d_name, skip) != 0) forEachFile(path, skip, each);
+        } else if (S_ISREG(st.st_mode)) {
+            each(path);
+        }
+    }
+    closedir(d);
+}
+
+static bool makeDirectories(const std::string& dir) {
+    for (size_t i = 1; i <= dir.size(); i++)
+        if (i == dir.size() || dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);
+    return isDirectory(dir);
+}
+
+static bool fileStamp(const std::string& path, uint64_t* size, int64_t* mtime) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    *size = uint64_t(st.st_size);
+    *mtime = int64_t(st.st_mtimespec.tv_sec) * 1000000000 + st.st_mtimespec.tv_nsec;
+    return true;
+}
+
+static void replaceFile(const std::string& from, const std::string& to) {
+    if (rename(from.c_str(), to.c_str()) != 0) remove(from.c_str());
+}
+#else
+static bool isDirectory(const std::string& d) {
+    std::error_code ec;
+    return std::filesystem::is_directory(d, ec);
+}
+
+template <class F>
+static void forEachFile(const std::string& dir, const char* skip, F&& each) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir, fs::directory_options::follow_directory_symlink, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_directory(ec) && it->path().filename() == skip) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        if (it->is_regular_file(ec)) each(it->path().string());
+    }
+}
+
+static bool makeDirectories(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return !ec;
+}
+
+static bool fileStamp(const std::string& path, uint64_t* size, int64_t* mtime) {
+    std::error_code ec;
+    uint64_t n = std::filesystem::file_size(path, ec);
+    if (ec) return false;
+    auto t = std::filesystem::last_write_time(path, ec);
+    if (ec) return false;
+    *size = n;
+    *mtime = int64_t(t.time_since_epoch().count());
+    return true;
+}
+
+static void replaceFile(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) std::filesystem::remove(from, ec);
+}
+#endif
+
+static void indexFile(const std::string& path, bool look) {
+    std::string ext = lowerExtension(path);
     if (ext != ".png" && ext != ".dds") return;
-    std::string stem = p.stem().string();
+    size_t slash = path.find_last_of("/\\");
+    std::string stem = path.substr(slash == std::string::npos ? 0 : slash + 1);
+    stem.resize(stem.size() - ext.size());
     if (stem.compare(0, 5, "tex1_") != 0) return;
     bool arb = false;
     if (endsWith(stem, "_arb")) {
@@ -176,11 +280,11 @@ static void indexFile(const std::filesystem::path& p, bool look) {
     if (f.look && !look) return;
     f.look = look;
     if (level == 0) {
-        if (f.path.empty()) f.path = p.string();
+        if (f.path.empty()) f.path = path;
         f.arbitrary = f.arbitrary || arb;
     } else {
         if (f.mips.size() < size_t(level)) f.mips.resize(size_t(level));
-        if (f.mips[size_t(level) - 1].empty()) f.mips[size_t(level) - 1] = p.string();
+        if (f.mips[size_t(level) - 1].empty()) f.mips[size_t(level) - 1] = path;
     }
 }
 
@@ -210,25 +314,16 @@ static void scan() {
     } else {
         dirs.insert(dirs.end(), {"mods/textures", "../../mods/textures"});
     }
-    namespace fs = std::filesystem;
     for (size_t i = 0; i < dirs.size(); i++) {
         const std::string& d = dirs[i];
         bool isLook = i == 0 && look && *look;
-        std::error_code ec;
-        if (!fs::is_directory(d, ec)) continue;
+        if (!isDirectory(d)) continue;
         size_t before = s_index.size();
-        for (auto it = fs::recursive_directory_iterator(d, fs::directory_options::follow_directory_symlink, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            // The UHD pack's widescreen_stars_fix blanks two star textures to
-            // hide stars Dolphin's widescreen hack shows at the screen's edges.
-            // One is the particle star of Mario's wall bonk and a stunned
-            // Cataquack, which it hides too; the port's widescreen needs no fix.
-            if (it->is_directory(ec) && it->path().filename() == "widescreen_stars_fix") {
-                it.disable_recursion_pending();
-                continue;
-            }
-            if (it->is_regular_file(ec)) indexFile(it->path(), isLook);
-        }
+        // The UHD pack's widescreen_stars_fix blanks two star textures to
+        // hide stars Dolphin's widescreen hack shows at the screen's edges.
+        // One is the particle star of Mario's wall bonk and a stunned
+        // Cataquack, which it hides too; the port's widescreen needs no fix.
+        forEachFile(d, "widescreen_stars_fix", [&](const std::string& path) { indexFile(path, isLook); });
         logmsg("texture pack: %zu textures under %s", s_index.size() - before, d.c_str());
     }
     for (auto it = s_index.begin(); it != s_index.end();)  // mips without a level 0
@@ -266,8 +361,7 @@ const char* hiresDumpDir() {
         const char* e = getenv("SMS_TEXTURE_DUMP");
         if (e && *e && strcmp(e, "0") != 0) {
             dir = e;
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
+            makeDirectories(dir);
         }
     }
     return dir;
@@ -584,7 +678,7 @@ static void idlePriority() {
 #if defined(_WIN32)
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
 #elif defined(__APPLE__)
-    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+    if (__builtin_available(macOS 10.10, *)) pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
 #elif defined(__linux__)
     sched_param p{};
     pthread_setschedparam(pthread_self(), SCHED_IDLE, &p);
@@ -644,9 +738,7 @@ void hiresPrefetchResource(const void* ptr, uint32_t size, const char* name) {
     bool model = !memcmp(data, "J3D2", 4), particle = !memcmp(data, "JEFFjpa1", 8);
     if (!model && !particle) {
         if (name) {
-            std::string ext = std::filesystem::path(name).extension().string();
-            for (char& c : ext) c = char(tolower(uint8_t(c)));
-            if (ext == ".bti" && data[0x19] != 0x6E) prefetchTimg(data, size, 0);
+            if (lowerExtension(name) == ".bti" && data[0x19] != 0x6E) prefetchTimg(data, size, 0);
         }
         return;
     }
@@ -905,22 +997,9 @@ static const std::string& mipCacheDir() {
         std::string d = e && *e ? std::string(e) : userCacheDir();
         if (d.empty()) return d;
         if (!(e && *e)) d += "/texture-mips";
-        std::error_code ec;
-        std::filesystem::create_directories(d, ec);
-        return ec ? std::string() : d;
+        return makeDirectories(d) ? d : std::string();
     }();
     return dir;
-}
-
-static bool sourceStamp(const std::string& path, uint64_t* size, int64_t* mtime) {
-    std::error_code ec;
-    uint64_t n = std::filesystem::file_size(path, ec);
-    if (ec) return false;
-    auto t = std::filesystem::last_write_time(path, ec);
-    if (ec) return false;
-    *size = n;
-    *mtime = int64_t(t.time_since_epoch().count());
-    return true;
 }
 
 static size_t blockLevelBytes(int blocks, int w, int h) {
@@ -934,7 +1013,7 @@ static void loadCachedLevels(const std::string& name, const PackFile& f, Loaded*
     if (dir.empty() || first >= full) return;
     uint64_t size;
     int64_t mtime;
-    if (!sourceStamp(f.path, &size, &mtime)) return;
+    if (!fileStamp(f.path, &size, &mtime)) return;
     FILE* in = fopen((dir + "/" + name + ".mips").c_str(), "rb");
     if (!in) return;
     MipsHeader hd;
@@ -963,7 +1042,7 @@ static void loadCachedLevels(const std::string& name, const PackFile& f, Loaded*
 static void storeCachedLevels(const std::string& name, const PackFile& f, const Loaded& L) {
     const std::string& dir = mipCacheDir();
     MipsHeader hd{};
-    if (dir.empty() || L.levels.empty() || !sourceStamp(f.path, &hd.size, &hd.mtime)) return;
+    if (dir.empty() || L.levels.empty() || !fileStamp(f.path, &hd.size, &hd.mtime)) return;
     memcpy(hd.magic, kMipsMagic, 8);
     hd.w = uint32_t(L.w);
     hd.h = uint32_t(L.h);
@@ -994,9 +1073,8 @@ static void storeCachedLevels(const std::string& name, const PackFile& f, const 
             std::this_thread::sleep_until(start + std::chrono::microseconds(n * 1000000 / (16u << 20)));
         }
     ok = fclose(out) == 0 && ok;
-    std::error_code ec;
-    if (ok) std::filesystem::rename(part, path, ec);
-    if (!ok || ec) std::filesystem::remove(part, ec);
+    if (ok) replaceFile(part, path);
+    else remove(part.c_str());
 }
 
 // A few UHD-pack shadows and clouds replacing intensity textures (I4, I8, IA4,

@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(sms_port C CXX)
+# macOS before 10.12 has no clock_gettime (CMAKE_OSX_DEPLOYMENT_TARGET=10.9 builds).
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 10.12)
+  add_compile_options("SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/port_macos_legacy.h")
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(SMS_DECOMP ${CMAKE_CURRENT_SOURCE_DIR}/decomp)

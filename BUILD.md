@@ -152,6 +152,29 @@ On Apple Silicon, macOS offers to install Rosetta 2 on first launch if it is mis
 Saves go to `~/.local/share/sms-port/card-a`, the same place as the terminal build.
 Keep the app private: it contains the whole game and the icon art from your disc, so sharing it is sharing the game.
 
+### macOS 10.9
+
+`./build.sh` makes a program for the macOS the SDK targets. For older Intel Macs (10.9 Mavericks and later), build x86_64 with an older deployment target, on any Mac with current Xcode:
+
+```sh
+tools/macos_legacy_sdl2.sh
+cmake -S . -B build/macos-10.9 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
+  -DSMS_ARCH=64 -DSMS_GX_BUILD_TESTS=OFF \
+  -DSMS_SDL2_FRAMEWORK="$PWD/build/deps/SDL2-10.9/SDL2.framework"
+cmake --build build/macos-10.9 --target sms
+cp -R build/deps/SDL2-10.9/SDL2.framework build/macos-10.9/
+```
+
+| Difference | Why |
+| --- | --- |
+| `SDL2.framework` from `tools/macos_legacy_sdl2.sh` | The official framework needs 10.11. The script builds SDL 2.30.11 for 10.9 with `tools/macos_legacy_sdl2.patch` (its live-resize timer used a 10.12 method) |
+| OpenGL only | The Vulkan backend (MoltenVK, glslang) needs 10.15, so `SMS_GX_VULKAN` defaults to off below it |
+| `src/port_macos_legacy.h` | Force-included below 10.12, which has no `clock_gettime` |
+| No `std::filesystem` below 10.15 | Texture packs and radar map packs list their folders with POSIX calls instead |
+
+The graphics need OpenGL 3.3, which 10.9 has on every Mac it runs on except those with Intel GMA X3100 graphics (early 2008 MacBooks).
+
 ## Windows (MSYS2 MINGW64)
 
 Install [MSYS2](https://www.msys2.org/) and open **MSYS2 MINGW64** from the Start menu.
