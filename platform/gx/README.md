@@ -182,7 +182,6 @@ The following are accepted, and their state is stored, but they have no or only 
 - pixel metrics with early Z on count only the pixels that pass the alpha test, also through the early-Z fallback
 - a textured RGBA8 quad through a **2-stage TEV** (texture × rasterized colour, then × konst colour): exact 8-bit results
 - an **EFB → texture copy** (RGBA8, and I8 through the luma conversion) sampled back
-- Delfino's goop loop: an I8 texture drawn and copied back into itself 20 times, at whole and fractional internal resolutions, 4:3 and 16:9, comes back unchanged in RAM
 - alpha blending, alpha compare, subtractive blending and scissor
 - an unclamped last TEV stage keeping its low 8 bits for the output and the alpha compare, as Bianco Hills' river surface needs (sms-launcher issue #60)
 - a quad exactly on an orthographic camera's far plane, as the episode select's gradient background is
@@ -215,7 +214,6 @@ Without them it still compiles, but only a host-supplied context (`GXPC_Init(get
   Other draws keep the late test even with early Z on: early fragment tests also count occlusion-query samples before the alpha test's `discard`, and the pollution counters draw with `ReInitializeGX`'s early Z, Z off and an alpha test (with every texel counted, Noki Bay's wall rocks never rose).
 - **EFB copies are also written back to RAM.**
   Every texture copy is encoded into its GX tile layout on the GPU, read back and stored (the GL copy stays as the sampling fast path), because the game reads some on the CPU: Delfino's goop map (`TPollutionLayer::isPolluted`) is updated only by EFB copies. A `DCFlushRange`/`DCStoreRange` over a copy drops the GL copy so RAM wins again. `SMS_GX_COPY_WRITEBACK=0` turns write-back off; `SMS_GX_COPY_LOG=n` logs the first n write-backs.
-  A full-size copy takes the EFB pixel under each texel's centre, and a write-back takes, for each texel the game sees, the copy texel that a draw of the copy shows at the pixel under that texel's centre. At a fractional internal resolution (FSR 1 and NIS modes) filtering between pixels made the goop, which the game draws and copies back into its own texture every frame, smear a pixel a frame, and the map the game reads sat a texel off. Centred widescreen draws and copies are offset by whole pixels of the scaled EFB for the same reason (107 × 1.5 put the goop's edges on pixel centres).
 - **Pixel metrics** (`GXClearPixMetric`/`GXReadPixMetric`) count samples that pass (a GL occlusion query) plus 4 per triangle, which the pollution counters subtract again; copy passes and the early-Z fallback's depth passes are not counted. A depth-writing, alpha-tested early-Z draw through the extension would count its alpha-rejected samples; the game reads metrics only around draws with Z off.
 - **GPU reads arrive one frame late.**
   A synchronous read makes the CPU wait until the GPU has drawn everything queued, so the two stop overlapping (the plaza made 30–85 such reads a frame).

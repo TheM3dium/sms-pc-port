@@ -126,7 +126,7 @@ static int s_msaa = 0;
 static GLuint s_efbResolveFbo, s_efbMsColor, s_efbMsDepth;
 static GLuint s_vao;
 static GLuint s_copyProg, s_copyVao;
-static GLint s_copyUMode, s_copyURect, s_copyUAlphaOne, s_copyUSrc;
+static GLint s_copyUMode, s_copyURect, s_copyUAlphaOne;
 static GLuint s_tmpFbo;
 static GLuint s_overlayTex[OVERLAY_SLOTS];
 static int s_overlayW[OVERLAY_SLOTS], s_overlayH[OVERLAY_SLOTS];
@@ -412,25 +412,13 @@ uniform sampler2D u_color;
 uniform sampler2D u_depth;
 uniform int u_mode;     // bit 5: depth copy, bit 4: intensity (YUV) conversion, bits 0-3: format
 uniform int u_alphaOne; // EFB pixel format has no alpha
-uniform vec4 u_src;     // a full-size copy (z > 0): its left and top edges and EFB pixels per texel, in EFB pixels
 in vec2 v_uv;
 out vec4 o_color;
 float q(float v, float bits) { float m = exp2(bits) - 1.0; return floor(v * m + 0.5) / m; }
-// A full-size copy's texel is the EFB pixel under its centre, as a draw of the copy over the
-// same rectangle takes the texel under each pixel's centre; at a fractional internal resolution
-// filtering there blended in the next pixel, and Delfino's goop, which is drawn and copied back
-// into its own texture every frame, smeared a pixel further each frame. A half-size copy keeps
-// the filtered read, which averages each 2x2 block of pixels as the GameCube does.
-ivec2 srcPixel(ivec2 size) {
-  vec2 at = u_src.xy + (floor(gl_FragCoord.xy) + 0.5) * u_src.zw;
-  return clamp(ivec2(floor(at)), ivec2(0), size - 1);
-}
-vec4 colourAt() { return u_src.z > 0.0 ? texelFetch(u_color, srcPixel(textureSize(u_color, 0)), 0) : texture(u_color, v_uv); }
-float depthAt() { return u_src.z > 0.0 ? texelFetch(u_depth, srcPixel(textureSize(u_depth, 0)), 0).r : texture(u_depth, v_uv).r; }
 void main() {
   int f = u_mode & 15;
   if ((u_mode & 32) != 0) {
-    uint z = uint(clamp(depthAt(), 0.0, 1.0) * 16777215.0);
+    uint z = uint(clamp(texture(u_depth, v_uv).r, 0.0, 1.0) * 16777215.0);
     float hi = float((z >> 16) & 255u) / 255.0, mid = float((z >> 8) & 255u) / 255.0, lo = float(z & 255u) / 255.0;
     if (f == 1) o_color = vec4(hi);                        // Z8
     else if (f == 11 || f == 3) o_color = vec4(mid, mid, mid, hi); // Z16 (IA8 layout)
@@ -442,7 +430,7 @@ void main() {
     else o_color = vec4(hi);
     return;
   }
-  vec4 c = colourAt();
+  vec4 c = texture(u_color, v_uv);
   if (u_alphaOne != 0) c.a = 1.0;
   if ((u_mode & 16) != 0) {
     float y = clamp(0.257 * c.r + 0.504 * c.g + 0.098 * c.b + 16.0 / 255.0, 0.0, 1.0);
@@ -471,24 +459,19 @@ void main() {
 
 // EFB copy write-back, encoded on the GPU: each output pixel holds 4 bytes of
 // the copy's GX tile layout (byte k in pixel k / 4 of rows 256 pixels wide),
-// so what is read back is the bytes to store. The game sees tw x th texels of
-// a copy that may be larger: a texel is the copy's one that a draw of it over
-// the copied rectangle shows at the EFB pixel under the texel's centre
-// (copyTexelFor; at a whole internal resolution, the middle pixel of the
-// texel's block). Tiles past the edges hold zeros: the encoding
+// so what is read back is the bytes to store. A texel is the copy's
+// (x * ow / tw, y * oh / th) one, as the game sees tw x th texels of a copy
+// that may be larger, and tiles past the edges hold zeros: the encoding
 // encodeTexture does on the CPU (SMS_GX_COPY_VERIFY=1 compares the two).
 static const char* kEncodeFs = R"(#version 330 core
 uniform sampler2D u_src;
 uniform ivec4 u_size;  // tw, th (the texels the game sees), ow, oh (the copy texture)
-uniform vec4 u_map;    // CopyMap: where the copy's left and top edges fall in their EFB pixels, EFB pixels per texel
-uniform vec2 u_step;   // and EFB pixels per copy texel
 uniform int u_layout;  // copyLayout: 0 I4, 1 I8, 2 IA4, 3 IA8, 4 RGB565, 5 RGB5A3, 6 RGBA8
 uniform int u_bytes;
 out vec4 o_color;
 uvec4 texel(int x, int y) {
   if (x >= u_size.x || y >= u_size.y) return uvec4(0u);
-  vec2 at = floor(u_map.xy + (vec2(x, y) + 0.5) * u_map.zw);  // the pixel under the texel's centre
-  ivec2 s = clamp(ivec2(floor((at + 0.5 - u_map.xy) / u_step)), ivec2(0), u_size.zw - 1);
+  ivec2 s = ivec2(x * u_size.z / u_size.x, y * u_size.w / u_size.y);
   return uvec4(texelFetch(u_src, s, 0) * 255.0 + 0.5);
 }
 uint enc4(uint v) { return (v * 15u + 127u) / 255u; }
@@ -530,7 +513,6 @@ void main() {
 }
 )";
 static GLuint s_encProg, s_encFbo, s_encTex;
-static GLint s_encUMap, s_encUStep;
 static GLint s_encUSize, s_encULayout, s_encUBytes;
 static int s_encRows = 0;
 
@@ -1320,15 +1302,12 @@ void rendererInit(float efbScale) {
     s_copyUMode = glGetUniformLocation(s_copyProg, "u_mode");
     s_copyURect = glGetUniformLocation(s_copyProg, "u_rect");
     s_copyUAlphaOne = glGetUniformLocation(s_copyProg, "u_alphaOne");
-    s_copyUSrc = glGetUniformLocation(s_copyProg, "u_src");
     s_encProg = compileProgram(kCopyVs, kEncodeFs);
     glUseProgram(s_encProg);
     glUniform1i(glGetUniformLocation(s_encProg, "u_src"), 0);
     const GLfloat wholeRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
     glUniform4fv(glGetUniformLocation(s_encProg, "u_rect"), 1, wholeRect);
     s_encUSize = glGetUniformLocation(s_encProg, "u_size");
-    s_encUMap = glGetUniformLocation(s_encProg, "u_map");
-    s_encUStep = glGetUniformLocation(s_encProg, "u_step");
     s_encULayout = glGetUniformLocation(s_encProg, "u_layout");
     s_encUBytes = glGetUniformLocation(s_encProg, "u_bytes");
     glGenFramebuffers(1, &s_encFbo);
@@ -2131,19 +2110,8 @@ static void screenExtent(float sx, float cx, float* outLo, float* outHi) {
     *outHi = hi;
 }
 
-// A centring offset (game x) moved to the nearest whole pixel of the scaled EFB. At a fractional
-// internal resolution s_ox alone can put a centred draw's edges on pixel centres (107 x 1.5 =
-// 160.5 at 16:9 with FSR 1 Performance at 1440p), where which pixels it covers and which texel
-// each shows are a coin toss; texture copies of such draws (Delfino's goop, copied back into
-// itself every frame) then crept a pixel a frame.
-static float pixelAligned(float b) {
-    if (b == 0.0f) return b;
-    const float px = float(scaled(s_efbW)) / float(s_efbW);
-    return roundf(b * px) / px;
-}
-
 // How the current batch's game coordinates map into the widened EFB.
-static XMap drawXMapExact() {
+static XMap drawXMap() {
     XMap m;
     if (s_efbW == EFB_W) return m;
     if (s_stretch2D && (g.xfReg[XFR_PROJ + 6] & 1)) {  // a fade or wipe: all of it across the frame
@@ -2196,12 +2164,6 @@ static XMap drawXMapExact() {
     bool spans = lo <= 2.0f && hi >= float(EFB_W) - 2.0f;
     if (spans && !artwork) m.a = s_stretch;
     else m.b = spans ? float(s_ox) : centredOffset((lo + hi) / 2);
-    return m;
-}
-
-static XMap drawXMap() {
-    XMap m = drawXMapExact();
-    m.b = pixelAligned(m.b);
     return m;
 }
 
@@ -2478,24 +2440,10 @@ static void storeEncoded(const uint8_t* enc, const void* dest, uint32_t n) {
     textureInvalidateRange(dest, n);
 }
 
-// Where a texture copy's texels lie in the EFB: its left and top edges' places in
-// their EFB pixels (0 to 1), and EFB pixels per game texel and per copy texel.
-struct CopyMap {
-    float fx, fy, perX, perY, stepX, stepY;
-};
-
-// The copy texel (of n along an axis) that a write-back takes for game texel t:
-// the one a draw of the copy over the copied rectangle shows at the EFB pixel
-// under t's centre. The encoding shader does the same.
-static int copyTexelFor(int t, float f, float per, float step, int n) {
-    const float at = floorf(f + (float(t) + 0.5f) * per);
-    return std::max(0, std::min(n - 1, int(floorf((at + 0.5f - f) / step))));
-}
-
 // Encodes the copy in `tex` (ow x oh) as tw x th texels of `layout` into
 // s_encTex and leaves s_encFbo bound for reading; returns the rows (of 256
 // pixels, 1 KiB) that hold the `bytes`.
-static int encodeCopy(GLuint tex, int ow, int oh, int tw, int th, const CopyMap& map, uint32_t layout, uint32_t bytes) {
+static int encodeCopy(GLuint tex, int ow, int oh, int tw, int th, uint32_t layout, uint32_t bytes) {
     const int rows = int((bytes + 1023) / 1024);
     if (rows > s_encRows) {
         if (!s_encTex) glGenTextures(1, &s_encTex);
@@ -2515,9 +2463,6 @@ static int encodeCopy(GLuint tex, int ow, int oh, int tw, int th, const CopyMap&
     glBindSampler(0, 0);
     const GLint size[4] = {tw, th, ow, oh};
     glUniform4iv(s_encUSize, 1, size);
-    const float where[4] = {map.fx, map.fy, map.perX, map.perY};
-    glUniform4fv(s_encUMap, 1, where);
-    glUniform2f(s_encUStep, map.stepX, map.stepY);
     glUniform1i(s_encULayout, GLint(layout));
     glUniform1i(s_encUBytes, GLint(bytes));
     glBindVertexArray(s_copyVao);
@@ -2536,8 +2481,7 @@ static bool copyVerify() {
     return on != 0;
 }
 
-static void verifyEncode(GLuint tex, int ow, int oh, int tw, int th, const CopyMap& map, uint32_t layout,
-                         const uint8_t* gpu, uint32_t n) {
+static void verifyEncode(GLuint tex, int ow, int oh, int tw, int th, uint32_t layout, const uint8_t* gpu, uint32_t n) {
     std::vector<uint8_t> px(size_t(ow) * oh * 4), texels(size_t(tw) * th * 4), enc(n);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, s_tmpFbo);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
@@ -2545,9 +2489,7 @@ static void verifyEncode(GLuint tex, int ow, int oh, int tw, int th, const CopyM
     glReadPixels(0, 0, ow, oh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     for (int y = 0; y < th; y++)
         for (int x = 0; x < tw; x++)
-            memcpy(&texels[(size_t(y) * tw + x) * 4],
-                   &px[(size_t(copyTexelFor(y, map.fy, map.perY, map.stepY, oh)) * ow +
-                        size_t(copyTexelFor(x, map.fx, map.perX, map.stepX, ow))) * 4], 4);
+            memcpy(&texels[(size_t(y) * tw + x) * 4], &px[(size_t(y) * oh / th * ow + size_t(x) * ow / tw) * 4], 4);
     encodeTexture(texels.data(), layout, uint32_t(tw), uint32_t(th), enc.data());
     uint32_t diff = 0, first = n;
     for (uint32_t i = 0; i < n; i++)
@@ -2630,20 +2572,19 @@ static void resolveWriteBacks(bool all) {
 }
 
 // tw x th: the copy's size in texels as the game sees it.
-static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, int th, const CopyMap& map,
-                          uint32_t layout) {
+static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, int th, uint32_t layout) {
     if (!dest || !copyWriteBackEnabled()) return;
     if (tw < 1 || th < 1) return;
     uint32_t bytes = texLevelBytes(layout, uint32_t(tw), uint32_t(th));
     if (!bytes) return;
     efbCopySetBytes(dest, bytes);
-    const int rows = encodeCopy(tex, ow, oh, tw, th, map, layout, bytes);
+    const int rows = encodeCopy(tex, ow, oh, tw, th, layout, bytes);
     const uint32_t readBytes = uint32_t(rows) * 1024;
     if (!asyncReads() || copyVerify()) {
         static std::vector<uint8_t> px;
         px.resize(readBytes);
         glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-        if (copyVerify()) verifyEncode(tex, ow, oh, tw, th, map, layout, px.data(), bytes);
+        if (copyVerify()) verifyEncode(tex, ow, oh, tw, th, layout, px.data(), bytes);
         if (!asyncReads()) {
             s_syncReads++;
             storeEncoded(px.data(), dest, bytes);
@@ -2738,8 +2679,6 @@ static void copyEfb(uint32_t ctrl) {
     // its columns in the scaled EFB, and its left edge and width in EFB pixels
     int x0 = scaled(x), x1 = scaled(x + w);
     float fx = float(x), fw = float(w);
-    if (s_efbW != EFB_W && !stretched && !(x == 0 && w == s_efbW))
-        fx = float(x - s_ox) + pixelAligned(float(s_ox));  // where the centred draws it copies landed
     if (stretched) {
         // A stretched piece's edges fall inside widened pixels, and its quad
         // covers the scaled columns up to them, so the copy and its clear take
@@ -2814,20 +2753,13 @@ static void copyEfb(uint32_t ctrl) {
         glBindTexture(GL_TEXTURE_2D, s_efbColor);
         float rect[4] = {fx / float(s_efbW), float(y) / EFB_H, fw / float(s_efbW), float(h) / EFB_H};
         glUniform4fv(s_copyURect, 1, rect);
-        // the copy's rectangle in EFB pixels (the scaled EFB is scaled(s_efbW) x scaled(EFB_H) of them)
-        const float pxX = float(scaled(s_efbW)) / float(s_efbW), pxY = float(scaled(EFB_H)) / EFB_H;
-        const float left = fx * pxX, top = float(y) * pxY, across = fw * pxX, down = float(h) * pxY;
-        const float src[4] = {left, top, half ? 0.0f : across / float(ow), down / float(oh)};
-        glUniform4fv(s_copyUSrc, 1, src);
-        const CopyMap map{left - floorf(left), top - floorf(top), across / float(tw), down / float(th),
-                          across / float(ow), down / float(oh)};
         glUniform1i(s_copyUMode, GLint(mode));
         glUniform1i(s_copyUAlphaOne, (g.bp[BP_PE_CONTROL] & 7) != 1);
         glBindVertexArray(s_copyVao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glBindVertexArray(s_vao);
         s_stats.efbCopies++;
-        writeBackCopy(dest, tex, ow, oh, tw, th, map, copyLayout(fmt, zcopy));
+        writeBackCopy(dest, tex, ow, oh, tw, th, copyLayout(fmt, zcopy));
     }
     if (clear) clearRect(x0, x1, y, h);
     glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);

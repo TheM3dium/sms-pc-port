@@ -31,8 +31,6 @@ void decodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h, con
 bool shaderHasEarlyFragmentTests();
 std::string hiresName(const uint8_t* data, uint32_t fmt, uint32_t w, uint32_t h, bool mipmapped, const uint8_t* tlut,
                       uint32_t tlutBytes, bool onlyIfPresent);
-bool rendererResize(float scale, int msaa);
-bool rendererSetWide(float wide);
 }
 
 // The OS layer normally provides these.
@@ -163,70 +161,6 @@ static void texSetup() {
     GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
     GXSetNumTexGens(1);
     GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-}
-
-// Encodes a w x h intensity image (w a multiple of 8, h of 4) into GX I8 tiles.
-static void encodeI8(const u8* img, int w, int h, u8* out) {
-    for (int ty = 0; ty < h; ty += 4)
-        for (int tx = 0; tx < w; tx += 8)
-            for (int i = 0; i < 32; i++) *out++ = img[(ty + i / 8) * w + tx + i % 8];
-}
-
-// Delfino's goop: each frame the game draws a layer's I8 texture into the EFB
-// over a viewport of its size, draws the cleaning into it, and copies it back
-// into the same texture (TPollutionCounterLayer::countTexDegree, the "graffito"
-// TEfbCtrlTex), then reads that texture on the CPU (TPollutionLayer::isPolluted).
-// That loop must give back what it was given at any internal resolution and
-// width: returns how many texels differ from the start after `rounds` of it.
-static int goopRoundTrips(float scale, float wide, int rounds) {
-    enum { W = 64, H = 64 };
-    static u8 img[W * H], start[W * H];
-    static u8 tex[W * H] __attribute__((aligned(32)));
-    for (int y = 0; y < H; y++)
-        for (int x = 0; x < W; x++) img[y * W + x] = u8((x * 37 + y * 101) % 251 + 2);  // no two neighbours alike
-    encodeI8(img, W, H, start);
-    memcpy(tex, start, sizeof tex);
-    DCFlushRange(tex, sizeof tex);
-    gx::rendererSetWide(wide);
-    gx::rendererResize(scale, 0);
-    GXSetViewport(0, 0, W, H, 0, 1);
-    Mtx44 m;  // the TOrthoProj the game puts over the layer's viewport: 0 to W across, 0 to H down
-    memset(m, 0, sizeof(m));
-    m[0][0] = 2.0f / W;
-    m[0][3] = -1.0f;
-    m[1][1] = -2.0f / H;
-    m[1][3] = 1.0f;
-    m[2][2] = -1.0f / 10;
-    m[2][3] = -1.0f;
-    m[3][3] = 1.0f;
-    GXSetProjection(m, GX_ORTHOGRAPHIC);
-    texSetup();
-    GXSetNumChans(1);
-    GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
-    GXSetNumTevStages(1);
-    GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
-    GXSetTevOp(GX_TEVSTAGE0, GX_REPLACE);
-    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
-    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
-    GXSetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
-    GXTexObj to;
-    GXInitTexObj(&to, tex, W, H, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-    GXInitTexObjLOD(&to, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
-    for (int i = 0; i < rounds; i++) {
-        GXLoadTexObj(&to, GX_TEXMAP0);
-        texQuad(0, 0, W, H, 255, 255, 255, 255);
-        GXSetTexCopySrc(0, 0, W, H);
-        GXSetTexCopyDst(W, H, GX_CTF_R8, GX_FALSE);
-        GXCopyTex(tex, GX_FALSE);
-    }
-    GXPixModeSync();
-    int differ = 0;
-    for (int i = 0; i < W * H; i++) differ += tex[i] != start[i];
-    gx::rendererResize(1, 0);
-    gx::rendererSetWide(1);
-    GXSetViewport(0, 0, 640, 480, 0, 1);
-    setOrtho();
-    return differ;
 }
 
 // A mipmapped 8x8 RGBA8 texture (levels 8x8 and 4x4) and, in a texture pack
@@ -853,22 +787,6 @@ int main(int argc, char** argv) {
         colorQuad(10, 10, 60, 60, 255, 0, 0, 255);
         expectPixel("game draw after cached overlay", 30, 30, 255, 0, 0);
         expect("overlay leaves no GL errors", glGetError() == GL_NO_ERROR);
-    }
-
-    // Delfino's goop through its draw-and-copy-back loop (goopRoundTrips): at
-    // 1.5x in 16:9 (FSR 1 Performance at 1440p) it slid a pixel a frame, and
-    // at most fractional scales the copy the game reads was off by a texel.
-    {
-        const float wide = (16.0f / 9.0f) / (4.0f / 3.0f);
-        const struct { float scale, wide; } cases[] = {{1, 1}, {2, wide}, {1.5f, wide}, {2.5f, wide}, {1.46f, wide},
-                                                      {1.125f, wide}, {1.25f, wide}, {1.46f, 1}, {1.75f, 1}};
-        for (const auto& c : cases) {
-            const int differ = goopRoundTrips(c.scale, c.wide, 20);
-            char what[96];
-            snprintf(what, sizeof what, "goop copy loop at %gx, %s: %d of 4096 texels moved", double(c.scale),
-                     c.wide > 1 ? "16:9" : "4:3", differ);
-            expect(what, differ == 0);
-        }
     }
 
     GXPCStats st;
