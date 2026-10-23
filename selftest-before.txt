@@ -1,0 +1,111 @@
+[sms_gx] OpenGL 3.3.0 NVIDIA 580.178.04, renderer NVIDIA GeForce GTX 1060 6GB/PCIe/SSE2 (NVIDIA Corporation)
+[sms_gx] post-processing: FXAA off, scaler bilinear, sharpen 0%, brightness 1.00, aspect keep
+[sms_gx] texture pack: 1 textures under /tmp/gx-selftest-pack-1804289383
+[sms_gx] GL thread running
+[sms_gx] headless OpenGL context ready
+[sms_gx] shader cache: 873 programs loaded, 55 skipped (/home/netflix/.cache/sms-port/gx-programs-32.bin)
+[sms_gx] shader warm-up: 849 known programs, 849 cached, compiled in parallel
+PASS copy-clear background                        (  5,  5) got  32  48  64 want  32  48  64
+PASS vertex colour quad                           ( 30, 30) got 255   0   0 want 255   0   0
+PASS outside the quad                             ( 70, 70) got  32  48  64 want  32  48  64
+PASS 2-stage TEV, red texel                       (150,150) got 128   0   0 want 128   0   0
+PASS 2-stage TEV, green texel                     (250,150) got   0  65   0 want   0  64   0
+PASS 2-stage TEV, blue texel                      (150,250) got   0   0  32 want   0   0  32
+PASS 2-stage TEV, white texel                     (250,250) got 128  65  32 want 128  64  32
+PASS EFB copy sampled back (TL)                   (425,125) got 128   0   0 want 128   0   0
+PASS EFB copy sampled back (BR)                   (475,175) got 128  65  32 want 128  64  32
+PASS I8 EFB copy (luma of white texel)            (595,175) got  85  85  85 want  84  84  84
+PASS alpha blend over red                         ( 30, 30) got 127   0 128 want 127   0 128
+PASS alpha compare rejects                        ( 30, 30) got 127   0 128 want 127   0 128
+PASS subtractive blend                            ( 30, 80) got  16  32  48 want  16  32  48
+FAIL inside scissor                               ( 15,110) got  32  48  64 want 255 255   0
+PASS outside scissor                              ( 30,110) got  32  48  64 want  32  48  64
+PASS unclamped TEV output wraps                   ( 95,110) got 144 200 100 want 144 200 100
+PASS alpha compare sees the wrapped alpha         ( 95,110) got 144 200 100 want 144 200 100
+PASS quad on the far plane                        (155,110) got   0 255 255 want   0 255 255
+PASS GD display list draw                         ( 95, 35) got   0 200   0 want   0 200   0
+PASS raw FIFO BP write                            (155, 35) got   0   0 255 want   0   0 255
+PASS lit quad (depth test keeps near)             (236,302) got 200 100  50 want 200 100  50
+PASS unlit quad = ambient * material              (403,302) got  50  25  13 want  50  25  13
+PASS GXPeekZ reports the near quad's depth
+PASS linear fog on a floor reaching behind the camera (320,302) got 100  50 152 want 100  50 153
+PASS fog with a far plane of 33333                (236,177) got 169  85  81 want 169  85  81
+PASS linear fog at half distance                  (403,177) got 100  50 152 want 100  50 153
+PASS spot light with zero attenuation ignored     (320,177) got 200 100  50 want 200 100  50
+     XFB 640x480, pixel (30,30) = 127 0 128
+PASS XFB holds the displayed frame
+PASS I4 decode
+PASS RGB5A3 decode
+PASS CMPR decode
+PASS CMPR 3-colour decode
+PASS C8 + RGB565 TLUT decode
+PASS alpha-rejected wall keeps colour             (140,140) got 255 255 255 want 255 255 255
+PASS late alpha rejection preserves depth
+PASS shadow visible without wall depth            (140,140) got  75  75  75 want  75  75  75
+PASS alpha-rejected wall keeps colour             (240,140) got 255 255 255 want 255 255 255
+PASS early alpha rejection writes depth
+PASS shadow blocked by early-Z wall               (240,140) got 255 255 255 want 255 255 255
+PASS early-Z overlapping LESS keeps first         (340,140) got 255   0   0 want 255   0   0
+PASS early-Z pixel metric skips alpha-rejected pixels
+PASS copy-clear enabled colour                    (440,140) got  32  48  64 want  32  48  64
+FAIL copy-clear preserves shadow alpha
+PASS copy-clear preserves disabled depth
+FAIL RGB8 copy-clear preserves backing alpha
+PASS copy-clear preserves disabled colour         (440,140) got  32  48  64 want  32  48  64
+PASS copy-clear enabled alpha
+PASS copy-clear enabled depth
+PASS HD replacement magnified samples level 0     ( 84,364) got 255   0   0 want 255   0   0
+PASS HD replacement samples level 1 at half size  (208,308) got   0 255   0 want   0 255   0
+PASS HD replacement at the original's size        (264,304) got   0   0 255 want   0   0 255
+FAIL HD replacement stops at the original's last level (301,301) got  32  48  64 want 255 255   0
+PASS overlay allocates initial texture
+PASS cached overlay draws without uploads
+PASS overlay ref[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 2x (1708x1056), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1.5x (1281x792), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 2.5x (2135x1320), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1.46x (1247x771), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1.125x (961x594), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1.25x (1068x660), 0 samples
+[sms_gx] internal resolution 1x (854x528), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1.46x (934x771), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+[sms_gx] internal resolution 1.75x (1120x924), 0 samples
+[sms_gx] internal resolution 1x (640x528), 0 samples
+resh reuses texture storage
+PASS overlay resize reallocates storage
+PASS performance panel caches its bitmap
+PASS speed change refreshes overlay immediately
+PASS window resize refreshes overlay immediately
+PASS hidden overlay does not upload
+PASS reopening overlay refreshes immediately
+PASS overlay GL status
+PASS game draw after cached overlay               ( 30, 30) got 255   0   0 want 255   0   0
+PASS overlay leaves no GL errors
+PASS goop copy loop at 1x, 4:3: 0 of 4096 texels moved
+PASS goop copy loop at 2x, 16:9: 0 of 4096 texels moved
+FAIL goop copy loop at 1.5x, 16:9: 4064 of 4096 texels moved
+FAIL goop copy loop at 2.5x, 16:9: 4064 of 4096 texels moved
+FAIL goop copy loop at 1.46x, 16:9: 4077 of 4096 texels moved
+FAIL goop copy loop at 1.125x, 16:9: 4053 of 4096 texels moved
+FAIL goop copy loop at 1.25x, 16:9: 4082 of 4096 texels moved
+FAIL goop copy loop at 1.46x, 4:3: 4070 of 4096 texels moved
+FAIL goop copy loop at 1.75x, 4:3: 3072 of 4096 texels moved
+stats: 185 draws, 740 vertices, 0 shaders compiled, 4 texture uploads, 180 EFB copies
+62 passed, 11 failed
