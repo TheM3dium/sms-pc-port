@@ -715,6 +715,12 @@ void player(TMario* m, const MpgCmd& c)
 	case MPG_PLAYER_WATER_USE:
 		MpPvpWaterUse(c.i[1]);
 		break;
+	case MPG_PLAYER_FLUDD:
+		if (c.i[1])
+			m->onFlag(MARIO_FLAG_HAS_FLUDD);
+		else if (!m->onYoshi()) // Yoshi's juice is FLUDD's nozzle
+			m->offFlag(MARIO_FLAG_HAS_FLUDD);
+		break;
 	case MPG_PLAYER_NOZZLE:
 		if (TWaterGun* gun = m->mWaterGun)
 			if (c.i[1] >= 0 && c.i[1] <= 5 && c.i[1] != 3) // not Yoshi's

@@ -7,7 +7,7 @@ Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefil
  {
 +#ifdef TARGET_PC
 +	// extensions may keep FLUDD from filling up (port_ext.h)
-+	if (port_ext_fludd_refill(mMario, PORT_REFILL_SUCK))
++	if (port_ext_fludd_refill(mMario, PORT_REFILL_SUCK, 0))
 +		return false;
 +#endif
  	if (mCurrentNozzle == (s8)Yoshi) {
@@ -22,7 +22,7 @@ Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefil
 -					mWaterGun->addWater(mWaterGun->getMaxWater() / 2);
 +#ifdef TARGET_PC
 +					// extensions may keep FLUDD from filling up (port_ext.h)
-+					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM, sender))
 +#endif
 +						mWaterGun->addWater(mWaterGun->getMaxWater() / 2);
  				}
@@ -35,7 +35,7 @@ Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefil
 -					mWaterGun->addWater(mWaterGun->getMaxWater());
 +#ifdef TARGET_PC
 +					// extensions may keep FLUDD from filling up (port_ext.h)
-+					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM, sender))
 +#endif
 +						mWaterGun->addWater(mWaterGun->getMaxWater());
  				}
@@ -48,7 +48,7 @@ Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefil
 -					mWaterGun->addWater(mWaterGun->getMaxWater());
 +#ifdef TARGET_PC
 +					// extensions may keep FLUDD from filling up (port_ext.h)
-+					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM, sender))
 +#endif
 +						mWaterGun->addWater(mWaterGun->getMaxWater());
  				}
@@ -61,7 +61,7 @@ Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefil
 -						mWaterGun->addWater(mWaterGun->getMaxWater());
 +#ifdef TARGET_PC
 +						// extensions may keep FLUDD from filling up (port_ext.h)
-+						if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++						if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM, sender))
 +#endif
 +							mWaterGun->addWater(mWaterGun->getMaxWater());
  					}
@@ -75,7 +75,7 @@ Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefil
  		portHit(actor, this, HIT_MESSAGE_HIP_DROP);
 +#ifdef TARGET_PC
 +		// extensions may keep FLUDD from filling up (port_ext.h)
-+		if (checkFlag(MARIO_FLAG_HAS_FLUDD) && !port_ext_fludd_refill(this, PORT_REFILL_BARREL)) {
++		if (checkFlag(MARIO_FLAG_HAS_FLUDD) && !port_ext_fludd_refill(this, PORT_REFILL_BARREL, actor)) {
 +#else
  		if (checkFlag(MARIO_FLAG_HAS_FLUDD)) {
 +#endif

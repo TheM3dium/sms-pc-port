@@ -230,9 +230,9 @@ extern "C" int port_ext_nozzle_fire(void* mario, int nozzle, int how)
 	return 0;
 }
 
-extern "C" int port_ext_fludd_refill(void* mario, int source)
+extern "C" int port_ext_fludd_refill(void* mario, int source, void* from)
 {
-	EACH(fluddRefill) if (s_ext[i]->fluddRefill(mario, source)) return 1;
+	EACH(fluddRefill) if (s_ext[i]->fluddRefill(mario, source, from)) return 1;
 	return 0;
 }
 

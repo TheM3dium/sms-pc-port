@@ -39,7 +39,7 @@ void MpPvpWaterUse(int percent);
 // The server set the tank (MPG_PLAYER_WATER, ADD_WATER): not FLUDD's own use.
 void MpPvpWaterSet();
 // The fluddRefill hook: 1 while MPG_RULE_NO_REFILL holds for this game's Mario.
-int MpPvpRefill(void* mario, int source);
+int MpPvpRefill(void* mario, int source, void* from);
 // Test aids' controller (SMS_MULTIPLAYER_TEST pvphunt@: R held down).
 void MpPvpPadRead(void* status);
 

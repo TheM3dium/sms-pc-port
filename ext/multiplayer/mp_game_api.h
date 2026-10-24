@@ -386,6 +386,7 @@ enum {
 	MPG_PLAYER_NOZZLE,        // i[1]: 0 spray, 1 rocket, 2 underwater, 4 hover, 5 turbo
 	MPG_PLAYER_ADD_WATER,     // i[1]: percent of a full tank added (less when negative)
 	MPG_PLAYER_WATER_USE,     // i[1]: FLUDD's water used at this percent of its own rate, for the session
+	MPG_PLAYER_FLUDD,         // i[1]: 1 FLUDD on the player's back, 0 off it
 };
 // MPG_CMD_RULES's bits
 #define MPG_RULE_NO_FLUDD   1u

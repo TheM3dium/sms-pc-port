@@ -29,6 +29,7 @@
 #include "../mp_game_api.h"
 #include "mp_puppet.hpp"
 #include "mp_server.hpp"
+#include "port_ext.h"
 
 #include <Camera/Camera.hpp>
 #include <JSystem/J3D/J3DGraphAnimator/J3DModel.hpp>
@@ -46,6 +47,7 @@
 #include <Player/ModelWaterManager.hpp>
 #include <Player/WaterGun.hpp>
 #include <Strategic/HitActor.hpp>
+#include <Strategic/LiveActor.hpp>
 #include <System/EmitterViewObj.hpp>
 #include <System/MarDirector.hpp>
 #include <System/Particles.hpp>
@@ -679,9 +681,10 @@ void MpPvpWaterUse(int percent)
 
 void MpPvpWaterSet() { s_waterSet = true; }
 
-int MpPvpRefill(void* mario, int source)
+int MpPvpRefill(void* mario, int source, void* from)
 {
 	(void)source;
+	(void)from;
 	return mario && mario == gpMarioOriginal && mpg_role() != MPG_ROLE_OFF && (MpServerRules() & MPG_RULE_NO_REFILL);
 }
 

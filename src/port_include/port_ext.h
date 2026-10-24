@@ -248,9 +248,10 @@ typedef struct PortExtension {
 	// number) stands for, where the episode select and the pause menu ask
 	// (its name, whether it is collected): `*shine` may be changed.
 	void (*episodeShine)(int shineStage, int episode, int* shine);
-	// FLUDD of a TMario is about to fill up, from `source` (PORT_REFILL_*):
-	// return 1 to stop it (the tank stays as it is).
-	int (*fluddRefill)(void* mario, int source);
+	// FLUDD of a TMario is about to fill up, from `source` (PORT_REFILL_*;
+	// `from` the item or barrel, null for the water around): return 1 to stop
+	// it (the tank stays as it is).
+	int (*fluddRefill)(void* mario, int source, void* from);
 } PortExtension;
 
 // fluddRefill's `source`
@@ -361,7 +362,7 @@ void port_ext_episode_shine(int shineStage, int episode, int* shine);
 int port_ext_player_message(void* mario, void* sender, unsigned message);
 void port_ext_player_mount(void* mario, int mount, int on, void* object);
 void port_ext_player_water(void* mario, int entered, float surfaceY);
-int port_ext_fludd_refill(void* mario, int source);
+int port_ext_fludd_refill(void* mario, int source, void* from);
 void port_ext_yoshi(void* yoshi, int what, unsigned fruit);
 void port_ext_actor_spawn(void* actor);
 void port_ext_object_hit_done(void* object, void* sender, unsigned message, int result);
