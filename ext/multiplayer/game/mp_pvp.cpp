@@ -70,7 +70,7 @@ const f32 kBodyHeight  = 170.0f; // feet to the top of the cap
 const f32 kHeadHeight  = 210.0f; // the meter's height over the feet (drawHPMeter's)
 const f32 kNearHeight  = 140.0f; // collision: closer than this up or down, they overlap
 const unsigned kReportMs = 100;  // hits gathered for this long before they are reported
-const unsigned kFlushMs  = 4000; // Shadow Mario's 120 frames at 30 a second
+const unsigned kFlushMs  = 800;  // a hit's flush: a moment, so it says "hit just now" (Shadow Mario's lasts 4 s: one attacker)
 const unsigned kMeterMs  = 20000; // and 600
 
 unsigned clockMs()
@@ -865,7 +865,9 @@ void MpPvpSplash(const MpgCmd& c)
 	s.meterUntil      = s.full ? now + kMeterMs : now;
 	const bool quiet  = (c.i[3] & MPG_SPLASH_QUIET) != 0;
 	if (!quiet) {
-		s.flushUntil = now + kFlushMs;
+		// how long the flush lasts: the command's f[3] seconds, else a moment
+		const unsigned flush = c.f[3] > 0.0f ? (unsigned)(c.f[3] < 10.0f ? c.f[3] * 1000.0f : 10000.0f) : kFlushMs;
+		s.flushUntil         = now + flush;
 		JGeometry::TVec3<f32> at(c.f[0], c.f[1], c.f[2]);
 		if (gpMarioParticleManager)
 			gpMarioParticleManager->emit(PARTICLE_MS_ENM_WATHIT, &at, 0, nullptr);

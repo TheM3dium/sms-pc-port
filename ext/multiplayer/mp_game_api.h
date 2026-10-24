@@ -357,7 +357,8 @@ enum {
 	MPG_CMD_SCREEN,     // i[0] MPG_SCREEN_*: in i[1]'s colour over f[0] seconds
 	MPG_CMD_SHAKE,      // the camera shakes, f[0] strong (1 a hard hit), for f[1] seconds
 	MPG_CMD_RUMBLE,     // the controller: i[0] 0 weak, 1 hard, i[1] times
-	MPG_CMD_SPLASH,     // slot i[0] splashed as Shadow Mario is: meter i[1] of i[2] (0 none), i[3] MPG_SPLASH_*, at f[0..2]
+	MPG_CMD_SPLASH,     // slot i[0] splashed as Shadow Mario is: meter i[1] of i[2] (0 none), i[3] MPG_SPLASH_*, at f[0..2],
+	                    // flushed for f[3] seconds (0: 0.8)
 	MPG_CMD_BOUNDS,     // the player kept within f[3] of f[0..2]; i[0] MPG_BOUNDS_RING, i[1] its colour; f[4] seconds to glide
 	MPG_CMD_LAST = MPG_CMD_BOUNDS,
 };
