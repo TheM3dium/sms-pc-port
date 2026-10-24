@@ -360,6 +360,7 @@ bool cancellable(uint32_t type)
 	case SMS_EV_MUSIC:
 	case SMS_EV_SAVE_PROMPT:
 	case SMS_EV_NOZZLE_FIRE:
+	case SMS_EV_FILE_STARTING:
 		return true;
 	default:
 		return type >= SMS_EV_CUSTOM_BASE;

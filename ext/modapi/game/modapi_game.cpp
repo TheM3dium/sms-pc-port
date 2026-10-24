@@ -949,6 +949,16 @@ void saveFile(int what, int file, int from)
 	modh_dispatch(SMS_EV_SAVE_FILE, &ev, sizeof ev);
 }
 
+int fileStarting(int file, int isNew)
+{
+	if (!modh_wants(SMS_EV_FILE_STARTING))
+		return 0;
+	SmsEvFileStarting ev;
+	ev.file   = file;
+	ev.is_new = isNew;
+	return modh_dispatch(SMS_EV_FILE_STARTING, &ev, sizeof ev);
+}
+
 int nozzleFire(void* m, int nozzle, int how)
 {
 	if (!m || m != (void*)gpMarioOriginal || !modh_wants(SMS_EV_NOZZLE_FIRE))
@@ -1132,6 +1142,7 @@ struct Register {
 		e.shineModel          = shineModel;
 		e.yoshiEgg            = yoshiEgg;
 		e.episodeShine        = episodeShine;
+		e.fileStarting        = fileStarting;
 		port_ext_register(&s_extension);
 	}
 } s_register;

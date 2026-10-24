@@ -1,0 +1,35 @@
+Reason: extensions (ext/, port_ext.h) may keep a file chosen at file select from starting, each frame (fileStarting): a mod's own screen before a game, the native mod API's SMS_EV_FILE_STARTING (API 1.5 beta 7); and the file select's last step, which runs every frame until the stage changes, runs the port's hooks (afterFileSelect, SMS_WARP) on the frame setNextStage takes only
+--- a/src/GC2D/CardLoad.cpp
++++ b/src/GC2D/CardLoad.cpp
+@@ -2873,6 +2873,16 @@
+ 	} break;
+ 
+ 	case PROGRESS_UNK29: {
++#ifdef TARGET_PC
++		// This step runs every frame until the stage changes, and
++		// setNextStage takes only the first (it latches 0x2): the port's hooks
++		// run on that frame only. Before it, extensions may keep the chosen
++		// file from starting yet (port_ext.h fileStarting): the file select
++		// waits as it is this frame.
++		const bool sms_ext_first = !gpMarDirector->checkUnk4CFlag(0x2);
++		if (sms_ext_first && port_ext_file_starting())
++			break;
++#endif
+ 		if (TFlagManager::getInstance()->getFlag(0x40000) < 1)
+ #ifdef TARGET_PC
+ 			// Eclipse rewrites the `li r4, 0x0` at 0x80164E30 (the stage of a
+@@ -2885,9 +2895,11 @@
+ 		else
+ 			gpMarDirector->setNextStage(1, nullptr);
+ #ifdef TARGET_PC
+-		port_warp_after_file_select();
+-		// where the chosen file starts, for extensions (port_ext.h)
+-		port_ext_after_file_select();
++		if (sms_ext_first) {
++			port_warp_after_file_select();
++			// where the chosen file starts, for extensions (port_ext.h)
++			port_ext_after_file_select();
++		}
+ #endif
+ 		gpCardManager->unmount();
+ 	} break;

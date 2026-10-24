@@ -248,6 +248,11 @@ typedef struct PortExtension {
 	// number) stands for, where the episode select and the pause menu ask
 	// (its name, whether it is collected): `*shine` may be changed.
 	void (*episodeShine)(int shineStage, int episode, int* shine);
+	// A file chosen at file select is about to start (TCardLoad's last step,
+	// before setNextStage), each frame until it does: `file` 0..2 (-1 without
+	// a memory card), `isNew` a new game. Return 1 to wait this frame (the
+	// file select stays as it is).
+	int (*fileStarting)(int file, int isNew);
 	// FLUDD of a TMario is about to fill up, from `source` (PORT_REFILL_*;
 	// `from` the item or barrel, null for the water around): return 1 to stop
 	// it (the tank stays as it is).
@@ -359,6 +364,8 @@ int port_ext_nozzle_fire(void* mario, int nozzle, int how);
 const char* port_ext_shine_model(void* shine, void* keeper, int collected);
 void port_ext_yoshi_egg(int kind, void* egg, int* present);
 void port_ext_episode_shine(int shineStage, int episode, int* shine);
+// 1 while an extension keeps the chosen file from starting (fileStarting).
+int port_ext_file_starting(void);
 int port_ext_player_message(void* mario, void* sender, unsigned message);
 void port_ext_player_mount(void* mario, int mount, int on, void* object);
 void port_ext_player_water(void* mario, int entered, float surfaceY);
