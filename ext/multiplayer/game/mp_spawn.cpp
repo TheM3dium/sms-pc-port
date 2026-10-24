@@ -278,6 +278,16 @@ TLiveActor* MpSpawned(int id)
 	return nullptr;
 }
 
+bool MpSpawnedPos(int i, float* at)
+{
+	// (a spawned bottle carries LIVE_FLAG_DEAD while it stands there: the
+	// caller keeps track of the ones it has been to)
+	if (i < 0 || i >= s_spawnedCount || !s_spawned[i].actor)
+		return false;
+	at[0] = s_spawned[i].actor->mPosition.x, at[1] = s_spawned[i].actor->mPosition.y, at[2] = s_spawned[i].actor->mPosition.z;
+	return true;
+}
+
 int MpSpawnedId(const TLiveActor* actor)
 {
 	for (int k = 0; k < s_spawnedCount; k++)

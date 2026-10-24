@@ -116,8 +116,15 @@ bool s_marioFogged;
 // is logged every second.
 struct Test {
 	bool parsed;
-	int huntAt, huntSlot, overlapAt, stompAt, outAt, pickupAt, seaAt;
+	int huntAt, huntSlot, overlapAt, stompAt, outAt, pickupAt, seaAt, botAt;
 	unsigned seaUntil;
+	// pvpbot@S: a player that plays (stick and buttons as a person would)
+	s8 botStickX, botStickY;
+	u8 botTrigger;
+	u16 botButtons;
+	bool botOn;
+	unsigned botTurnAt, botJumpAt, botJumpUntil;
+	f32 botStrafe, botWander;
 	unsigned stageAt, lastHunt, overlapUntil, outUntil, lastPickup, lastTank;
 	bool overlapped, stomped, hunting, outDone;
 };
@@ -493,7 +500,7 @@ void testParse()
 	if (s_test.parsed)
 		return;
 	s_test.parsed = true;
-	s_test.huntAt = s_test.huntSlot = s_test.overlapAt = s_test.stompAt = s_test.outAt = s_test.pickupAt = s_test.seaAt = -1;
+	s_test.huntAt = s_test.huntSlot = s_test.overlapAt = s_test.stompAt = s_test.outAt = s_test.pickupAt = s_test.seaAt = s_test.botAt = -1;
 	const char* plan = getenv("SMS_MULTIPLAYER_TEST");
 	if (!plan)
 		return;
@@ -505,10 +512,140 @@ void testParse()
 		sscanf(t, "pvpstomp@%d", &s_test.stompAt);
 	if (const char* o = strstr(plan, "pvpout@"))
 		sscanf(o, "pvpout@%d", &s_test.outAt);
+	if (const char* b = strstr(plan, "pvpbot@"))
+		sscanf(b, "pvpbot@%d", &s_test.botAt);
 	if (const char* w = strstr(plan, "pvpsea@"))
 		sscanf(w, "pvpsea@%d", &s_test.seaAt);
 	if (const char* k = strstr(plan, "pvppickup@"))
 		sscanf(k, "pvppickup@%d", &s_test.pickupAt);
+}
+
+// The stick that takes Mario along world yaw `yaw` (TMario::checkController:
+// the stick's angle, matan(-v, h), plus the camera's), `mag` 0..1.
+void botStick(f32 yaw, f32 mag)
+{
+	const f32 cam = gpCamera ? (f32)gpCamera->getUnk258() * (3.14159265f / 32768.0f) : 0.0f;
+	const f32 d   = yaw - cam;
+	s_test.botStickX = (s8)(sinf(d) * 100.0f * mag);
+	s_test.botStickY = (s8)(-cosf(d) * 100.0f * mag);
+}
+
+f32 yawTo(const TMario* m, f32 x, f32 z) { return atan2f(x - m->mPosition.x, z - m->mPosition.z); }
+
+// pvpbot@S: plays as a person would, by its controller. Without FLUDD (a
+// lobby) it runs about the edge's middle, jumping now and then; with it, it
+// goes for the nearest player, circles them spraying, strafing one way then
+// the other, and when its tank runs low runs for the nearest of the server's
+// spawned pickups. Near the arena's edge it heads back in.
+void botTick(TMario* m)
+{
+	const unsigned now = clockMs();
+	const int me       = mpg_slot() < 0 ? 0 : mpg_slot();
+	s_test.botButtons  = 0;
+	s_test.botTrigger  = 0;
+	s_test.botStickX = s_test.botStickY = 0;
+	s_test.botOn       = true;
+	if (now >= s_test.botTurnAt) { // a new whim every two to four seconds
+		s_test.botTurnAt = now + 2000 + (now * 7 + me * 911) % 2000;
+		s_test.botStrafe = ((now / 1000 + me) & 1) ? 1.0f : -1.0f;
+		s_test.botWander += 1.3f + 0.4f * me;
+	}
+	if (now >= s_test.botJumpAt) {
+		s_test.botJumpAt    = now + 2500 + (now * 13 + me * 577) % 3500;
+		s_test.botJumpUntil = now + 120;
+	}
+	const bool jump = now < s_test.botJumpUntil;
+	TWaterGun* gun  = m->mWaterGun;
+	const bool fludd = gun && m->checkFlag(MARIO_FLAG_HAS_FLUDD);
+	const f32 r      = boundsRadius(now);
+	f32 cx = m->mPosition.x, cz = m->mPosition.z;
+	if (s_bounds.on)
+		cx = s_bounds.at[0], cz = s_bounds.at[2];
+	const f32 fromMiddle = sqrtf((m->mPosition.x - cx) * (m->mPosition.x - cx) + (m->mPosition.z - cz) * (m->mPosition.z - cz));
+	if (!fludd) {
+		// the lobby: about the middle, half the edge out
+		const f32 aim = s_bounds.on ? r * 0.5f : 300.0f;
+		botStick(yawTo(m, cx + aim * sinf(s_test.botWander), cz + aim * cosf(s_test.botWander)), 0.9f);
+		if (jump)
+			s_test.botButtons |= PAD_BUTTON_A;
+		return;
+	}
+	if (s_bounds.on && fromMiddle > r * 0.85f) { // the edge: back in
+		botStick(yawTo(m, cx, cz), 1.0f);
+		return;
+	}
+	const f32 water = gun->getMaxWater() > 0 ? (f32)gun->mCurrentWater / (f32)gun->getMaxWater() : 0.0f;
+	static unsigned said;
+	if (debug() && now - said >= 1000) {
+		said = now;
+		fprintf(stderr, "[multiplayer] bot: water %.2f, %.0f from the middle (edge %.0f), status %x, stick %d %d\n", water,
+		        fromMiddle, r, (unsigned)m->mStatus, s_test.botStickX, s_test.botStickY);
+	}
+	if (water < 0.12f) { // the nearest pickup
+		// the pickups it has not been to yet (each one taken is gone, and
+		// comes back as a new one)
+		static bool been[128];
+		static u32 beenSession;
+		if (beenSession != mpg_session()) {
+			beenSession = mpg_session();
+			memset(been, 0, sizeof been);
+		}
+		f32 at[3], best[3], bestD = 1e30f;
+		for (int i = 0; i < 128; i++)
+			if (!been[i] && MpSpawnedPos(i, at)) {
+				const f32 dx = at[0] - m->mPosition.x, dz = at[2] - m->mPosition.z;
+				if (dx * dx + dz * dz < 180.0f * 180.0f) {
+					been[i] = true;
+					continue;
+				}
+				if (dx * dx + dz * dz < bestD) {
+					bestD = dx * dx + dz * dz;
+					memcpy(best, at, sizeof best);
+				}
+			}
+		static unsigned toldCapsule;
+		if (debug() && now - toldCapsule >= 1000) {
+			toldCapsule = now;
+			fprintf(stderr, "[multiplayer] bot: for a capsule %.0f away (at %.0f %.0f)\n", sqrtf(bestD), bestD < 1e29f ? best[0] : 0.0f,
+			        bestD < 1e29f ? best[2] : 0.0f);
+		}
+		if (bestD < 1e29f) {
+			botStick(yawTo(m, best[0], best[2]), 1.0f);
+			if (jump && bestD > 600.0f * 600.0f)
+				s_test.botButtons |= PAD_BUTTON_A;
+			return;
+		}
+	}
+	const int t = nearest(m, -1);
+	if (t < 0 || water < 0.03f) { // nobody here, or nothing to spray: keep moving
+		botStick(yawTo(m, cx + r * 0.4f * sinf(s_test.botWander), cz + r * 0.4f * cosf(s_test.botWander)), 1.0f);
+		if (jump)
+			s_test.botButtons |= PAD_BUTTON_A;
+		return;
+	}
+	TMpPuppet* p = MpPuppet(t);
+	const f32 dx = p->mPosition.x - m->mPosition.x, dz = p->mPosition.z - m->mPosition.z;
+	const f32 d  = sqrtf(dx * dx + dz * dz);
+	const f32 toward = atan2f(dx, dz);
+	if (d > 750.0f) { // run at them
+		botStick(toward, 1.0f);
+		if (jump)
+			s_test.botButtons |= PAD_BUTTON_A;
+		return;
+	}
+	// close: aim and spray (facing them: Mario sprays the way he faces), then
+	// run a few steps round them to a new angle, and again
+	const bool aiming = (now + (unsigned)me * 900u) % 2700u < 1700u;
+	if (aiming && water > 0.03f && d < 700.0f) {
+		botStick(toward, d > 450.0f ? 0.35f : 0.2f);
+		s_test.botButtons |= PAD_TRIGGER_R;
+		s_test.botTrigger = 255;
+		return;
+	}
+	const f32 off = d < 300.0f ? 2.0f : d > 550.0f ? 0.7f : 1.4f;
+	botStick(toward + off * s_test.botStrafe, 1.0f);
+	if (jump)
+		s_test.botButtons |= PAD_BUTTON_A;
 }
 
 void testTick(TMario* m)
@@ -517,8 +654,11 @@ void testTick(TMario* m)
 	const unsigned now = clockMs();
 	const int secs     = (int)((now - s_test.stageAt) / 1000);
 	s_test.hunting     = false;
+	s_test.botOn       = false;
 	if (!m)
 		return;
+	if (s_test.botAt >= 0 && secs >= s_test.botAt)
+		botTick(m);
 	// pvpsea@S: into the nearest water deep enough to wade in, spraying for five seconds
 	if (s_test.seaAt >= 0 && secs >= s_test.seaAt && !s_test.seaUntil && gpMap) {
 		s_test.seaUntil = now + 5000;
@@ -627,6 +767,15 @@ void testTick(TMario* m)
 
 void MpPvpPadRead(void* status)
 {
+	if (s_test.botOn) {
+		PADStatus& pad   = static_cast<PADStatus*>(status)[0];
+		pad.button       = s_test.botButtons;
+		pad.stickX       = s_test.botStickX;
+		pad.stickY       = s_test.botStickY;
+		pad.triggerRight = s_test.botTrigger;
+		pad.substickX = pad.substickY = 0;
+		return;
+	}
 	if (!s_test.hunting)
 		return;
 	PADStatus& pad   = static_cast<PADStatus*>(status)[0];

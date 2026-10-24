@@ -50,6 +50,8 @@ void MpSpawnStageSetup();
 void MpSpawn(const MpgCmd& c);
 // The copy with that id (MPG_CMD_SPAWN's i[3]), or null.
 TLiveActor* MpSpawned(int id);
+// Spawned copy i (0 up) where it is (test aids).
+bool MpSpawnedPos(int i, float* at);
 // Its id, or 0: the stage's own.
 int MpSpawnedId(const TLiveActor* actor);
 
