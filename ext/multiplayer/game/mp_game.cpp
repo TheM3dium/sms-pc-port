@@ -5116,6 +5116,7 @@ struct Register {
 	{
 		s_extension.sound        = soundHook;
 		s_extension.stageLoading = stageLoading;
+		s_extension.fluddRefill  = MpPvpRefill;
 		port_ext_register(&s_extension);
 	}
 } s_register;

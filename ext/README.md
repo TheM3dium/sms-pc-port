@@ -51,6 +51,7 @@ An extension fills in a `PortExtension` with the hooks it needs, leaving the res
 | `shineModel` | a `TShine` is about to make its model (`TShine::makeMActors`) | register a model in the given keeper and return its name for the Shine to take |
 | `yoshiEgg` | whether Yoshi's egg is there (`TEggYoshi::load`, the plaza's egg event in `TMarDirector::setupObjects`; `PORT_EGG_*`) | change it |
 | `episodeShine` | the episode select and the pause menu ask which Shine an episode stands for | change it |
+| `fluddRefill` | FLUDD is about to fill up: from the water around (`TWaterGun::suck`), a bottle, fruit or 1-up, or a barrel's hip drop (`PORT_REFILL_*`; `zzzzz-ext-26`) | return 1 to stop it |
 | `chooseStageLoad`, `stageLoading` | a stage is about to load, its episode chosen (`TApplication`'s `APP_STATE_GAMEPLAY`: after a world's episode select, after `moveStage` picks the plaza's episode), before the movie it opens with; once a load, every `chooseStageLoad` before any `stageLoading` (given the stage the game chose) | load another (`port_ext_load_instead`) or change `mPrevArea`, where Mario comes from (multiplayer's host sends the players where its mods chose, a travelling client loads the host's) |
 | `playerStatusChanged` | `TMario::changePlayerStatus` took a new status (after the game's own rewrites), or a spin jump started in the air (`considerJumpRotate`) | note it |
 | `playerHeal` | `TMario::incHP`, or a pickup that fills Mario's health at once (a 1-up, a Shine, his cap) | change the amount, or return 1 to stop it |

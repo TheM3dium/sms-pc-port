@@ -230,6 +230,12 @@ extern "C" int port_ext_nozzle_fire(void* mario, int nozzle, int how)
 	return 0;
 }
 
+extern "C" int port_ext_fludd_refill(void* mario, int source)
+{
+	EACH(fluddRefill) if (s_ext[i]->fluddRefill(mario, source)) return 1;
+	return 0;
+}
+
 extern "C" const char* port_ext_shine_model(void* shine, void* keeper, int collected)
 {
 	EACH(shineModel) if (const char* name = s_ext[i]->shineModel(shine, keeper, collected)) return name;

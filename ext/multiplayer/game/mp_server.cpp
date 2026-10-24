@@ -701,7 +701,19 @@ void player(TMario* m, const MpgCmd& c)
 		if (TWaterGun* gun = m->mWaterGun) {
 			const int pct      = c.i[1] < 0 ? 0 : c.i[1] > 100 ? 100 : c.i[1];
 			gun->mCurrentWater = gun->getMaxWater() * pct / 100;
+			MpPvpWaterSet();
 		}
+		break;
+	case MPG_PLAYER_ADD_WATER:
+		if (TWaterGun* gun = m->mWaterGun) {
+			const int pct = c.i[1] < -100 ? -100 : c.i[1] > 100 ? 100 : c.i[1];
+			s32 water     = gun->mCurrentWater + gun->getMaxWater() * pct / 100;
+			gun->mCurrentWater = water < 0 ? 0 : water > gun->getMaxWater() ? gun->getMaxWater() : water;
+			MpPvpWaterSet();
+		}
+		break;
+	case MPG_PLAYER_WATER_USE:
+		MpPvpWaterUse(c.i[1]);
 		break;
 	case MPG_PLAYER_NOZZLE:
 		if (TWaterGun* gun = m->mWaterGun)
@@ -972,6 +984,9 @@ void run(TMarDirector* dir, const MpgCmd& c)
 	case MPG_CMD_SPLASH:
 		MpPvpSplash(c);
 		break;
+	case MPG_CMD_BOUNDS:
+		MpPvpBounds(c);
+		break;
 	case MPG_CMD_RUMBLE:
 		if (SMSRumbleMgr && !MpServerDedicated())
 			SMSRumbleMgr->start(c.i[0] ? 21 : 20, c.i[1] > 1 ? (c.i[1] < 20 ? c.i[1] : 20) : 1, (f32*)nullptr);
@@ -1166,6 +1181,14 @@ void MpServerPadRead(void* status)
 int MpServerNoDamage() { return (s_rules & MPG_RULE_NO_DAMAGE) != 0; }
 
 unsigned MpServerRules() { return s_rules; }
+
+bool MpServerMarker(int i, float* at)
+{
+	if (i < 0 || i >= kMarkers || !s_markers[i].on || s_markers[i].slot >= 0)
+		return false;
+	at[0] = s_markers[i].at.x, at[1] = s_markers[i].at.y, at[2] = s_markers[i].at.z;
+	return true;
+}
 
 // ------------------------------------------------------------------- what the host's mods ask
 

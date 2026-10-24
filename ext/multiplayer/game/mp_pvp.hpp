@@ -32,6 +32,14 @@ void MpPvpDraw(JDrama::TGraphics* graphics);
 // The drawn water of player `slot` (MpEmitWater): its drops carry its slot, so
 // they hit everyone but them.
 u16 MpPvpWaterTag(int slot);
+// MPG_CMD_BOUNDS, carried out: the arena's edge.
+void MpPvpBounds(const MpgCmd& c);
+// MPG_PLAYER_WATER_USE: FLUDD's water used at `percent` of its own rate.
+void MpPvpWaterUse(int percent);
+// The server set the tank (MPG_PLAYER_WATER, ADD_WATER): not FLUDD's own use.
+void MpPvpWaterSet();
+// The fluddRefill hook: 1 while MPG_RULE_NO_REFILL holds for this game's Mario.
+int MpPvpRefill(void* mario, int source);
 // Test aids' controller (SMS_MULTIPLAYER_TEST pvphunt@: R held down).
 void MpPvpPadRead(void* status);
 

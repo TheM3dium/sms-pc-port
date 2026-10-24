@@ -1,0 +1,84 @@
+Reason: extensions (ext/, port_ext.h) may keep FLUDD from filling up (fluddRefill): from the water around (TWaterGun::suck), a bottle, fruit or 1-up (TMario::receiveMessage's addWater), or a barrel's hip drop (TMario::hitBarrel): multiplayer's MPG_RULE_NO_REFILL, the mod API's SMS_RULE_NO_REFILL (API 1.5 beta 7)
+--- a/src/Player/WaterGun.cpp
++++ b/src/Player/WaterGun.cpp
+@@ -2177,6 +2177,11 @@
+ }
+ BOOL TWaterGun::suck()
+ {
++#ifdef TARGET_PC
++	// extensions may keep FLUDD from filling up (port_ext.h)
++	if (port_ext_fludd_refill(mMario, PORT_REFILL_SUCK))
++		return false;
++#endif
+ 	if (mCurrentNozzle == (s8)Yoshi) {
+ 		return false;
+ 	} else {
+--- a/src/Player/MarioReceiveMsg.cpp
++++ b/src/Player/MarioReceiveMsg.cpp
+@@ -232,7 +232,11 @@
+ 		case 0x20000001: // small water restore
+ 			if (message == HIT_MESSAGE_ATTACK) {
+ 				if (checkFlag(MARIO_FLAG_HAS_FLUDD)) {
+-					mWaterGun->addWater(mWaterGun->getMaxWater() / 2);
++#ifdef TARGET_PC
++					// extensions may keep FLUDD from filling up (port_ext.h)
++					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++#endif
++						mWaterGun->addWater(mWaterGun->getMaxWater() / 2);
+ 				}
+ 				emitGetWaterEffect();
+ 				return TRUE;
+@@ -241,7 +245,11 @@
+ 		case 0x20000002: // full water restore
+ 			if (message == HIT_MESSAGE_ATTACK) {
+ 				if (checkFlag(MARIO_FLAG_HAS_FLUDD)) {
+-					mWaterGun->addWater(mWaterGun->getMaxWater());
++#ifdef TARGET_PC
++					// extensions may keep FLUDD from filling up (port_ext.h)
++					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++#endif
++						mWaterGun->addWater(mWaterGun->getMaxWater());
+ 				}
+ 				emitGetWaterEffect();
+ 				return TRUE;
+@@ -258,7 +266,11 @@
+ 			if (message == HIT_MESSAGE_ATTACK) {
+ 				incHP(4);
+ 				if (checkFlag(MARIO_FLAG_HAS_FLUDD)) {
+-					mWaterGun->addWater(mWaterGun->getMaxWater());
++#ifdef TARGET_PC
++					// extensions may keep FLUDD from filling up (port_ext.h)
++					if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++#endif
++						mWaterGun->addWater(mWaterGun->getMaxWater());
+ 				}
+ 				emitGetEffect();
+ 				return TRUE;
+@@ -296,7 +308,11 @@
+ 					mHealth = mDeParams.mHPMax.get();
+ #endif
+ 					if (checkFlag(MARIO_FLAG_HAS_FLUDD)) {
+-						mWaterGun->addWater(mWaterGun->getMaxWater());
++#ifdef TARGET_PC
++						// extensions may keep FLUDD from filling up (port_ext.h)
++						if (!port_ext_fludd_refill(this, PORT_REFILL_ITEM))
++#endif
++							mWaterGun->addWater(mWaterGun->getMaxWater());
+ 					}
+ 					TFlagManager::smInstance->incMario(1);
+ 					emitGetEffect();
+--- a/src/Player/MarioCheckCol.cpp
++++ b/src/Player/MarioCheckCol.cpp
+@@ -152,7 +152,12 @@
+ 	    && actor->mPosition.y < mPosition.y
+ 	    && mStatus == MARIO_STATUS_HIP_DROP) {
+ 		portHit(actor, this, HIT_MESSAGE_HIP_DROP);
++#ifdef TARGET_PC
++		// extensions may keep FLUDD from filling up (port_ext.h)
++		if (checkFlag(MARIO_FLAG_HAS_FLUDD) && !port_ext_fludd_refill(this, PORT_REFILL_BARREL)) {
++#else
+ 		if (checkFlag(MARIO_FLAG_HAS_FLUDD)) {
++#endif
+ 			TWaterGun* wg     = mWaterGun;
+ 			wg->mCurrentWater = (s32)((const TWaterGun*)wg)
+ 			                        ->getCurrentNozzle()
